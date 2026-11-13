@@ -1,0 +1,100 @@
+# 四平台构建工作流（参考件，fork 建仓后放入 .github/workflows/release.yml）
+#
+# 依据（2026-11-13 实测）：
+# - Windows：本机已验证 cargo build --release 全流程通过；需要 protoc
+#   （GH windows runner 无预装，用 choco 装 protobuf）
+# - aws-lc-sys（LanceDB 依赖链）需要 cmake —— GH 三种 runner 都预装了 cmake
+# - curl-sys vendored 构建（gix 的 openssl 传输）需要 perl —— runner 均预装
+# - 原生二进制 ~190MB 未瘦身；发布前用 strip + zip 压缩
+#   （fork 的 Cargo.toml 另加 [profile.release] strip = true, panic = "abort"）
+#
+# 触发：手动 dispatch + tag 推送（v*）
+
+name: release-build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact: semcode-win-x64
+          - os: macos-14          # Apple Silicon
+            target: aarch64-apple-darwin
+            artifact: semcode-mac-arm64
+          - os: macos-13          # Intel（首发必须项之一）
+            target: x86_64-apple-darwin
+            artifact: semcode-mac-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: semcode-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protobuf -y
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          for b in semcode semcode-index semcode-lsp semcode-mcp; do
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              cp "target/${{ matrix.target }}/release/$b.exe" dist/
+            else
+              cp "target/${{ matrix.target }}/release/$b" dist/
+              strip "dist/$b" || true
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  # 蒸馏模型为平台无关产物（safetensors + tokenizer），单独一个 job 出一份，
+  # 随插件 zip 分发时并入（见 dev/02-deveco-plugin.md 打包节）
+  distill-model:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Download nomic weights
+        env:
+          HF_HUB_DISABLE_XET: '1'   # xet 后端会卡死，见 dev/05 记录
+        run: uv run --script scripts/direct_download.py
+      - name: Distill to model2vec
+        run: uv run --script scripts/nomic2vec.py -o dist/model2vec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semcode-model2vec
+          path: dist/model2vec
