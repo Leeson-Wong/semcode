@@ -1,0 +1,31 @@
+<idea-plugin>
+    <id>dev.semcode.intellij</id>
+    <name>Semcode</name>
+    <vendor>semcode</vendor>
+    <description>Semantic code search powered by semcode: natural-language function search, call graph, regex search. Works across IntelliJ IDEs and DevEco Studio.</description>
+
+    <!-- 平台模块：语言无关，IDEA/CLion/PyCharm/RustRover/DevEco 通吃 -->
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Semcode"
+                    anchor="right"
+                    icon="AllIcons.Toolwindows.ToolWindowMessages"
+                    factoryClass="dev.semcode.intellij.toolwindow.SemcodeToolWindowFactory"/>
+        <applicationService serviceImplementation="dev.semcode.intellij.settings.SemcodeSettings"/>
+        <notificationGroup id="Semcode" displayType="BALLOON"/>
+        <applicationConfigurable parentId="tools"
+                                 instance="dev.semcode.intellij.settings.SemcodeSettingsConfigurable"
+                                 id="dev.semcode.intellij.settings"
+                                 displayName="Semcode"/>
+    </extensions>
+
+    <actions>
+        <action id="Semcode.IndexProject"
+                class="dev.semcode.intellij.actions.IndexProjectAction"
+                text="Index Project with Semcode"
+                description="Run semcode-index (source + vectors) for the current project">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
