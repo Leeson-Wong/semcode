@@ -96,14 +96,14 @@ impl LoreDateFilter {
         }
         if let Some(ts) = date_timestamp {
             if ts != 0 {
-                return !self.since.is_some_and(|s| ts < s.timestamp())
-                    && !self.until.is_some_and(|u| ts > u.timestamp());
+                return self.since.is_none_or(|s| ts >= s.timestamp())
+                    && self.until.is_none_or(|u| ts <= u.timestamp());
             }
         }
         match DateTime::parse_from_rfc2822(date) {
             Ok(dt) => {
                 let dt = dt.with_timezone(&Utc);
-                !self.since.is_some_and(|s| dt < s) && !self.until.is_some_and(|u| dt > u)
+                self.since.is_none_or(|s| dt >= s) && self.until.is_none_or(|u| dt <= u)
             }
             Err(_) => {
                 *bad_dates += 1;

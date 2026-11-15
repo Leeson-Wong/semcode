@@ -2446,8 +2446,8 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
     },
     ToolCategory {
         name: "status",
-        description: "System status - check background indexing progress",
-        tool_names: &["indexing_status"],
+        description: "System status and indexing control - check background indexing progress, trigger project (re)indexing",
+        tool_names: &["indexing_status", "index_project"],
     },
 ];
 
@@ -2724,6 +2724,12 @@ fn get_tool_schema(name: &str) -> Option<Value> {
                         "description": "Maximum number of results to return (default: 100, 0 = unlimited)",
                         "default": 100,
                         "minimum": 0
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "description": "Output format. 'text' (default) renders human-readable output; 'json' returns a structured object with results: [{name, file_path, line_start, matched_lines: [{line, text}]}] for programmatic consumers.",
+                        "default": "text"
                     }
                 },
                 "required": ["pattern"]
@@ -2757,6 +2763,12 @@ fn get_tool_schema(name: &str) -> Option<Value> {
                         "default": 10,
                         "minimum": 1,
                         "maximum": 100
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "description": "Output format. 'text' (default) renders human-readable output; 'json' returns a structured object with results: [{name, file_path, line_start, return_type, parameters, similarity, preview}] for programmatic consumers.",
+                        "default": "text"
                     }
                 },
                 "required": ["query_text"]
@@ -3062,10 +3074,23 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "indexing_status" => Some(json!({
             "name": "indexing_status",
-            "description": "Check the status of the background indexing operation. Returns current state, progress, and any errors.",
+            "description": "Check indexing status: this session's incremental run (state, progress, errors) plus database facts — how many functions the index holds and whether the current HEAD commit is indexed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
+            }
+        })),
+        "index_project" => Some(json!({
+            "name": "index_project",
+            "description": "Trigger (re)indexing of the project's current commit in the background: source extraction and, optionally, vector generation for semantic search. Returns immediately; poll indexing_status for progress. Only one indexing run per database at a time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "vectors": {
+                        "type": "boolean",
+                        "description": "Also generate vectors for semantic search (vgrep). Default true. Slower on large repositories; requires the embedding model to be available."
+                    }
+                }
             }
         })),
         "list_branches" => Some(json!({
@@ -3118,6 +3143,7 @@ fn get_all_tool_schemas() -> Vec<Value> {
         "dig",
         "vlore_similar_emails",
         "indexing_status",
+        "index_project",
         "list_branches",
         "compare_branches",
     ];
@@ -3289,10 +3315,10 @@ impl McpServer {
                 // Completely empty database
                 match &state.status {
                     IndexingStatus::NotStarted => {
-                        Some("Database is empty. Background indexing hasn't started yet. Please wait a moment and try again.".to_string())
+                        Some("Database is empty and indexing has not started. Wait for the background auto-index, or trigger it now with the index_project tool.".to_string())
                     }
                     IndexingStatus::Completed { .. } => {
-                        Some("Database is empty. This repository may not contain any C/C++ source files, or indexing didn't find any functions.".to_string())
+                        Some("Database is empty. This repository may not contain any supported source files, or indexing didn't find any functions. You can retry with the index_project tool.".to_string())
                     }
                     _ => None,
                 }
@@ -3440,6 +3466,7 @@ impl McpServer {
             "dig" => self.handle_dig(arguments).await,
             "vlore_similar_emails" => self.handle_vlore_similar_emails(arguments).await,
             "indexing_status" => self.handle_indexing_status().await,
+            "index_project" => self.handle_index_project(arguments).await,
             "list_branches" => self.handle_list_branches().await,
             "compare_branches" => self.handle_compare_branches(arguments).await,
             // Lazy loading meta-tools
@@ -3542,6 +3569,7 @@ impl McpServer {
             "dig" => self.handle_dig(tool_args).await,
             "vlore_similar_emails" => self.handle_vlore_similar_emails(tool_args).await,
             "indexing_status" => self.handle_indexing_status().await,
+            "index_project" => self.handle_index_project(tool_args).await,
             "list_branches" => self.handle_list_branches().await,
             "compare_branches" => self.handle_compare_branches(tool_args).await,
             // Meta-tools cannot be called via call_tool
@@ -3894,8 +3922,21 @@ impl McpServer {
         let branch_arg = args["branch"].as_str();
         let path_pattern = args["path_pattern"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+        let format = args["format"].as_str().unwrap_or("text");
 
         let git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
+
+        if format == "json" {
+            return match grep_json_results(&self.db, pattern, path_pattern, limit, &git_sha).await {
+                Ok(v) => json!({
+                    "content": [{"type": "text", "text": v.to_string()}]
+                }),
+                Err(e) => json!({
+                    "error": format!("Failed to search function bodies: {}", e),
+                    "isError": true
+                }),
+            };
+        }
 
         match mcp_grep_function_bodies(&self.db, pattern, verbose, path_pattern, limit, &git_sha)
             .await
@@ -3926,8 +3967,29 @@ impl McpServer {
         let branch_arg = args["branch"].as_str();
         let path_pattern = args["path_pattern"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+        let format = args["format"].as_str().unwrap_or("text");
 
         let _git_sha = self.resolve_git_sha_or_branch(git_sha_arg, branch_arg);
+
+        if format == "json" {
+            return match vgrep_json_results(
+                &self.db,
+                query_text,
+                limit,
+                path_pattern,
+                &self.model_path,
+            )
+            .await
+            {
+                Ok(v) => json!({
+                    "content": [{"type": "text", "text": v.to_string()}]
+                }),
+                Err(e) => json!({
+                    "error": format!("Failed to search similar functions: {}", e),
+                    "isError": true
+                }),
+            };
+        }
 
         match mcp_vgrep_similar_functions(
             &self.db,
@@ -4579,8 +4641,13 @@ impl McpServer {
                     format!("{} ({})", phase, current)
                 }
             }
+            // 0 here means this session's incremental pass found nothing new;
+            // the Database section below says what the index actually holds.
+            IndexingStatus::Completed { files_processed: 0 } => {
+                "Completed (nothing new — index up to date)".to_string()
+            }
             IndexingStatus::Completed { files_processed } => {
-                format!("Completed ({} files processed)", files_processed)
+                format!("Completed ({files_processed} files processed)")
             }
             IndexingStatus::Failed { error } => {
                 format!("Failed: {}", error)
@@ -4609,9 +4676,90 @@ impl McpServer {
             result.push_str(&format!("Git SHA: {}\n", &sha[..8.min(sha.len())]));
         }
         result.push_str(&format!("Elapsed time: {}\n", elapsed));
+        drop(state);
+
+        // Database facts, independent of this session's incremental pass:
+        // what the index actually holds, and whether current HEAD is in it.
+        let functions = self.db.count_functions().await.unwrap_or(0);
+        let head_indexed = match &self.default_git_sha {
+            Some(sha) => self
+                .db
+                .query_commits_chunk_filtered(std::slice::from_ref(sha), &[], &[])
+                .await
+                .map(|commits| !commits.is_empty())
+                .unwrap_or(false),
+            None => false,
+        };
+        result.push_str(&format!("\nDatabase: {functions} functions indexed\n"));
+        if let Some(sha) = &self.default_git_sha {
+            result.push_str(&format!(
+                "Current HEAD {}: {}\n",
+                &sha[..8.min(sha.len())],
+                if head_indexed {
+                    "indexed"
+                } else {
+                    "NOT indexed — run index_project"
+                }
+            ));
+        }
 
         json!({
             "content": [{"type": "text", "text": result}]
+        })
+    }
+
+    async fn handle_index_project(&self, args: &Value) -> Value {
+        let vectors = args["vectors"].as_bool().unwrap_or(true);
+
+        // One indexing run per database at a time. The guard is best-effort:
+        // the startup auto-index sets InProgress only once it starts
+        // processing, so a small race window remains.
+        {
+            let mut state = self.indexing_state.lock().await;
+            if let IndexingStatus::InProgress { ref phase, .. } = state.status {
+                return json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "Indexing is already in progress ({}). Poll indexing_status for progress.",
+                            phase
+                        )
+                    }],
+                    "isError": true
+                });
+            }
+            state.git_sha = None;
+            state.started_at = Some(std::time::SystemTime::now());
+            state.completed_at = None;
+            state.status = IndexingStatus::InProgress {
+                phase: "Starting".to_string(),
+                current: 0,
+                total: None,
+            };
+        }
+
+        let db = self.db.clone();
+        let git_repo = self.git_repo_path.clone();
+        let model_path = self.model_path.clone();
+        let indexing_state = self.indexing_state.clone();
+        let notification_tx = self.notification_tx.clone();
+        tokio::spawn(async move {
+            run_index_project(
+                db,
+                git_repo,
+                vectors,
+                model_path,
+                indexing_state,
+                notification_tx,
+            )
+            .await;
+        });
+
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "Indexing started in the background. Poll the indexing_status tool for progress. Source extraction runs first, then vector generation if enabled."
+            }]
         })
     }
 
@@ -4862,6 +5010,113 @@ async fn mcp_diff_functions(diff_content: &str) -> Result<String> {
     )?;
 
     Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Structured (JSON) variant of grep_functions for programmatic consumers
+/// such as the IDE plugin. Mirrors the default text mode's line matching.
+async fn grep_json_results(
+    db: &DatabaseManager,
+    pattern: &str,
+    path_pattern: Option<&str>,
+    limit: usize,
+    git_sha: &str,
+) -> Result<Value> {
+    let (matching_functions, limit_hit) = db
+        .grep_function_bodies_git_aware(pattern, path_pattern, limit, git_sha)
+        .await?;
+
+    let regex = regex::Regex::new(pattern)?;
+
+    let mut results = Vec::new();
+    let mut total_line_matches = 0usize;
+    for func in &matching_functions {
+        let mut matched_lines = Vec::new();
+        for (i, line) in func.body.lines().enumerate() {
+            if regex.is_match(line) {
+                matched_lines.push(json!({
+                    "line": func.line_start + i as u32,
+                    "text": line.trim(),
+                }));
+            }
+        }
+        if matched_lines.is_empty() {
+            continue;
+        }
+        total_line_matches += matched_lines.len();
+        results.push(json!({
+            "name": func.name,
+            "file_path": func.file_path,
+            "line_start": func.line_start,
+            "matched_lines": matched_lines,
+        }));
+    }
+
+    Ok(json!({
+        "pattern": pattern,
+        "git_sha": git_sha,
+        "total_function_matches": matching_functions.len(),
+        "total_line_matches": total_line_matches,
+        "limit_hit": limit_hit,
+        "results": results,
+    }))
+}
+
+/// Structured (JSON) variant of vgrep_functions for programmatic consumers
+/// such as the IDE plugin. Returns the same matches the text renderer shows.
+async fn vgrep_json_results(
+    db: &DatabaseManager,
+    query_text: &str,
+    limit: usize,
+    path_pattern: Option<&str>,
+    model_path: &Option<String>,
+) -> Result<Value> {
+    use semcode::CodeVectorizer;
+
+    let vectorizer = CodeVectorizer::new_with_config(false, model_path.clone()).await?;
+    let query_vector = vectorizer.vectorize_code(query_text)?;
+
+    // When path filtering, over-fetch then filter down, same as the text path.
+    let search_limit = if path_pattern.is_some() { 1000 } else { limit };
+    let matches = db
+        .search_similar_functions_with_scores(&query_vector, search_limit, None)
+        .await?;
+
+    let final_matches: Vec<_> = if let Some(path_regex) = path_pattern {
+        let path_re = regex::Regex::new(path_regex)?;
+        matches
+            .into_iter()
+            .filter(|m| path_re.is_match(&m.function.file_path))
+            .take(limit)
+            .collect()
+    } else {
+        matches
+    };
+
+    let results: Vec<Value> = final_matches
+        .iter()
+        .map(|m| {
+            let func = &m.function;
+            let preview: Vec<&str> = func.body.lines().take(5).collect();
+            json!({
+                "name": func.name,
+                "file_path": func.file_path,
+                "line_start": func.line_start,
+                "return_type": func.return_type,
+                "parameters": func
+                    .parameters
+                    .iter()
+                    .map(|p| format!("{} {}", p.type_name, p.name))
+                    .collect::<Vec<_>>(),
+                "similarity": (m.similarity_score * 1000.0).round() / 10.0,
+                "preview": preview.join("\n"),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "query_text": query_text,
+        "results": results,
+    }))
 }
 
 async fn mcp_grep_function_bodies(
@@ -6072,6 +6327,203 @@ fn progress_notification(message: &str) -> Value {
 }
 
 /// Background task to index the current commit if needed (non-blocking)
+/// Explicit project indexing triggered through the index_project tool.
+/// Runs the same source pipeline as the startup auto-index, optionally
+/// followed by vector generation, and rolls back the git_commits rows a
+/// failed run recorded so later runs do not skip those commits.
+async fn run_index_project(
+    db_manager: Arc<DatabaseManager>,
+    git_repo: String,
+    vectors: bool,
+    model_path: Option<String>,
+    indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
+    notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+) {
+    let send_notification = |message: String| {
+        let tx = notification_tx.clone();
+        tokio::spawn(async move {
+            let guard = tx.lock().await;
+            if let Some(sender) = guard.as_ref() {
+                let notification = progress_notification(&message);
+                let _ = sender.send(serde_json::to_string(&notification).unwrap_or_default());
+            }
+        });
+    };
+
+    let git_sha = match semcode::git::get_git_sha(&git_repo) {
+        Ok(Some(sha)) => {
+            {
+                let mut state = indexing_state.lock().await;
+                state.git_sha = Some(sha.clone());
+            }
+            sha
+        }
+        Ok(None) => {
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: "Not in a git repository".to_string(),
+            };
+            send_notification(
+                "Semcode: index_project failed - not in a git repository".to_string(),
+            );
+            return;
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to get git SHA: {}", e);
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: error_msg.clone(),
+            };
+            send_notification(format!("Semcode: index_project failed - {}", error_msg));
+            return;
+        }
+    };
+
+    // Snapshot commit rows so a failed run can undo its own bookkeeping.
+    let existing_shas: std::collections::HashSet<String> = db_manager
+        .get_all_git_commits()
+        .await
+        .map(|commits| commits.into_iter().map(|c| c.git_sha).collect())
+        .unwrap_or_default();
+
+    // The tool can run before the startup task has created the schema, or
+    // race it: "already exists" means the schema landed either way.
+    if let Err(e) = db_manager.create_tables().await {
+        if !e.to_string().contains("already exists") {
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed {
+                error: format!("Failed to create tables: {}", e),
+            };
+            send_notification(format!("Semcode: index_project failed - {}", e));
+            return;
+        }
+    }
+
+    {
+        let mut state = indexing_state.lock().await;
+        state.status = IndexingStatus::InProgress {
+            phase: "Indexing source".to_string(),
+            current: 0,
+            total: None,
+        };
+    }
+    send_notification("Semcode: index_project - indexing source".to_string());
+
+    let repo_path = PathBuf::from(&git_repo);
+    let git_range = format!("{}^..{}", git_sha, git_sha);
+    let extensions_vec = semcode::file_extensions::supported_extensions();
+
+    let range_result = semcode::git_range::process_git_range(
+        &repo_path,
+        &git_range,
+        &extensions_vec,
+        db_manager.clone(),
+        false,
+        4,
+        &[],
+    )
+    .await;
+    let files_processed = match &range_result {
+        Ok(stats) => stats.files_processed,
+        Err(_) => 0,
+    };
+    if let Err(e) = range_result {
+        // Undo the commit rows this run added: they would make later runs
+        // treat these commits as already indexed and skip them silently.
+        let added: Vec<String> = db_manager
+            .get_all_git_commits()
+            .await
+            .map(|commits| {
+                commits
+                    .into_iter()
+                    .map(|c| c.git_sha)
+                    .filter(|sha| !existing_shas.contains(sha))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !added.is_empty() {
+            if let Err(cleanup_err) = db_manager.remove_git_commits(&added).await {
+                eprintln!(
+                    "[index_project] Warning: failed to roll back {} commit rows: {}",
+                    added.len(),
+                    cleanup_err
+                );
+            }
+        }
+        let msg = format!("Indexing failed: {}", e);
+        eprintln!("[index_project] {}", msg);
+        {
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::Failed { error: msg.clone() };
+            state.completed_at = Some(std::time::SystemTime::now());
+        }
+        send_notification(format!("Semcode: index_project failed - {}", msg));
+        return;
+    }
+
+    if vectors {
+        {
+            let mut state = indexing_state.lock().await;
+            state.status = IndexingStatus::InProgress {
+                phase: "Generating vectors".to_string(),
+                current: 0,
+                total: None,
+            };
+        }
+        send_notification("Semcode: index_project - generating vectors".to_string());
+
+        match semcode::CodeVectorizer::new_with_config(false, model_path).await {
+            Ok(vectorizer) => match db_manager.update_vectors(&vectorizer).await {
+                Ok(()) => {
+                    // Commit and lore vectors power commit/lore search; treat
+                    // their failure as a warning, not a failed run.
+                    if let Err(e) = db_manager.update_commit_vectors(&vectorizer).await {
+                        eprintln!("[index_project] Warning: commit vectors failed: {}", e);
+                    }
+                    if let Err(e) = db_manager.update_lore_vectors(&vectorizer).await {
+                        eprintln!("[index_project] Warning: lore vectors failed: {}", e);
+                    }
+                    if let Err(e) = db_manager.create_vector_index().await {
+                        eprintln!(
+                            "[index_project] Warning: vector index creation failed: {}",
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[index_project] Warning: vector generation failed: {}", e);
+                    send_notification(format!(
+                        "Semcode: index_project - vector generation failed: {}",
+                        e
+                    ));
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "[index_project] Warning: model unavailable, vectors skipped: {}",
+                    e
+                );
+                send_notification(format!(
+                    "Semcode: index_project - vectors skipped, model unavailable: {}",
+                    e
+                ));
+            }
+        }
+    }
+
+    eprintln!("[index_project] Indexing complete ({files_processed} files)");
+    {
+        let mut state = indexing_state.lock().await;
+        state.status = IndexingStatus::Completed { files_processed };
+        state.completed_at = Some(std::time::SystemTime::now());
+    }
+    send_notification(if files_processed == 0 {
+        "Semcode: index_project complete — index already up to date".to_string()
+    } else {
+        format!("Semcode: index_project complete ({files_processed} files)")
+    });
+}
+
 async fn index_current_commit_background(
     db_manager: Arc<DatabaseManager>,
     git_repo: String,
@@ -6224,15 +6676,18 @@ async fn index_current_commit_background(
     )
     .await
     {
-        Ok(()) => {
-            eprintln!("[Background] Indexing complete");
+        Ok(stats) => {
+            eprintln!(
+                "[Background] Indexing complete ({} files, {} functions)",
+                stats.files_processed, stats.functions_count
+            );
             send_notification("Semcode: Indexing complete".to_string());
 
             // Update state to completed
             {
                 let mut state = indexing_state.lock().await;
                 state.status = IndexingStatus::Completed {
-                    files_processed: 0, // We don't have exact count from process_git_range
+                    files_processed: stats.files_processed,
                 };
                 state.completed_at = Some(std::time::SystemTime::now());
             }
@@ -6436,6 +6891,21 @@ async fn main() -> Result<()> {
 
     // Process database path with search order: 1) -d flag, 2) current directory
     let database_path = process_database_path(args.database.as_deref(), None);
+
+    // A database that does not exist yet will be created (schema only) and
+    // filled by the background auto-index below. Say so loudly: a server
+    // pointed at an unindexed directory otherwise looks like an empty
+    // database, and queries against it read as "nothing found".
+    let database_existed = std::path::Path::new(&database_path).exists();
+    if !database_existed {
+        eprintln!(
+            "No existing index at {}. A fresh database will be created and the \
+             current commit auto-indexed in the background; until it finishes, \
+             queries return 'database is empty'. Large repositories are better \
+             served by 'semcode-index -s <repo>' or the index_project tool.",
+            database_path
+        );
+    }
 
     // Create MCP server
     let server =
@@ -6944,9 +7414,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_all_tool_schemas_returns_19_tools() {
+    fn test_get_all_tool_schemas_returns_20_tools() {
         let schemas = get_all_tool_schemas();
-        assert_eq!(schemas.len(), 19, "Should return all 19 tool schemas");
+        assert_eq!(schemas.len(), 20, "Should return all 20 tool schemas");
     }
 
     #[test]
@@ -7222,8 +7692,8 @@ mod tests {
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
 
-        // Should return all 19 tools
-        assert_eq!(tools.len(), 19, "Non-lazy mode should return all 19 tools");
+        // Should return all 20 tools
+        assert_eq!(tools.len(), 20, "Non-lazy mode should return all 20 tools");
     }
 
     #[tokio::test]

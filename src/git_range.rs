@@ -109,14 +109,14 @@ const RESULT_CHANNEL_DEPTH: usize = 2;
 
 /// Statistics from processing git file tuples (lightweight, no accumulated data)
 #[derive(Debug, Default, Clone)]
-struct GitTupleStats {
-    files_processed: usize,
-    functions_count: usize,
-    types_count: usize,
+pub struct GitTupleStats {
+    pub files_processed: usize,
+    pub functions_count: usize,
+    pub types_count: usize,
     /// Batches whose facts or mark were not all stored, counting the batch
     /// a panicked inserter held, and the files they left unmarked.
-    failed_batches: usize,
-    failed_files: usize,
+    pub failed_batches: usize,
+    pub failed_files: usize,
 }
 
 impl GitTupleStats {
@@ -1483,7 +1483,7 @@ pub async fn process_git_range(
     no_macros: bool,
     db_threads: usize,
     includes: &[std::path::PathBuf],
-) -> Result<()> {
+) -> Result<GitTupleStats> {
     info!(
         "Processing git range {} using streaming file tuple pipeline",
         git_range
@@ -1660,7 +1660,8 @@ pub async fn process_git_range(
     // Do not write a database version. Part of the database was updated here,
     // but other parts could have been written by an older version of semcode.
 
-    stats.unstored_batches_error()
+    stats.unstored_batches_error()?;
+    Ok(stats)
 }
 
 #[cfg(test)]

@@ -2407,7 +2407,7 @@ impl VectorSearchManager {
         tracing::info!("Starting function content vectorization");
 
         // Build hashset of all existing vector content_hashes upfront
-        println!("Loading existing vectors into memory...");
+        tracing::info!("Loading existing vectors into memory...");
         let vectors_table = self.connection.open_table("vectors").execute().await?;
         let existing_vector_results = vectors_table
             .query()
@@ -2428,7 +2428,7 @@ impl VectorSearchManager {
             }
         }
 
-        println!(
+        tracing::info!(
             "Loaded {} existing content hashes into memory",
             existing_content_hashes.len()
         );
@@ -2457,7 +2457,7 @@ impl VectorSearchManager {
         }
 
         if total_entries == 0 {
-            println!("No content found in database");
+            tracing::info!("No content found in database");
             return Ok(());
         }
 
@@ -2620,7 +2620,7 @@ impl VectorSearchManager {
 
         // Hashset is automatically freed here when function returns
         drop(existing_content_hashes);
-        println!("Function vectorization complete, memory freed");
+        tracing::info!("Function vectorization complete, memory freed");
 
         Ok(())
     }
@@ -2647,11 +2647,11 @@ impl VectorSearchManager {
         let total_commits: usize = commit_results.iter().map(|batch| batch.num_rows()).sum();
 
         if total_commits == 0 {
-            println!("No commits found in database");
+            tracing::info!("No commits found in database");
             return Ok(());
         }
 
-        println!("Found {} commits to vectorize", total_commits);
+        tracing::info!("Found {} commits to vectorize", total_commits);
 
         // Check which commits already have vectors
         let commit_vectors_table = self
@@ -2722,13 +2722,13 @@ impl VectorSearchManager {
         }
 
         if commits_to_vectorize.is_empty() {
-            println!("All commits already have vectors");
+            tracing::info!("All commits already have vectors");
             return Ok(());
         }
 
         // Free the hashset now that we've filtered commits
         drop(existing_commit_shas);
-        println!(
+        tracing::info!(
             "Commit hashset freed, {} commits to vectorize",
             commits_to_vectorize.len()
         );
@@ -2869,13 +2869,13 @@ impl VectorSearchManager {
                         existing_message_ids.insert(message_id_array.value(i).to_string());
                     }
                 }
-                println!(
+                tracing::info!(
                     "Loaded {} existing lore message IDs into memory",
                     existing_message_ids.len()
                 );
             }
             Err(_) => {
-                println!("No existing lore vectors found (first run)");
+                tracing::info!("No existing lore vectors found (first run)");
             }
         }
 
@@ -2883,7 +2883,7 @@ impl VectorSearchManager {
         let existing_message_ids = Arc::new(existing_message_ids);
 
         // Count total for progress bar
-        println!("Counting lore emails...");
+        tracing::info!("Counting lore emails...");
         let mut total_emails = 0;
         let mut emails_needing_vectors = 0;
 
@@ -2901,13 +2901,14 @@ impl VectorSearchManager {
         }
 
         if emails_needing_vectors == 0 {
-            println!("All {} lore emails already have vectors", total_emails);
+            tracing::info!("All {} lore emails already have vectors", total_emails);
             return Ok(());
         }
 
-        println!(
+        tracing::info!(
             "Found {} total lore emails, {} need vectorization",
-            total_emails, emails_needing_vectors
+            total_emails,
+            emails_needing_vectors
         );
 
         let pb = ProgressBar::new(emails_needing_vectors as u64);
@@ -3167,7 +3168,7 @@ impl VectorSearchManager {
 
         // Hashset is automatically freed here when function returns
         drop(existing_message_ids);
-        println!("Lore vectorization complete, memory freed");
+        tracing::info!("Lore vectorization complete, memory freed");
 
         Ok(())
     }

@@ -762,29 +762,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Stage and commit everything, without inheriting the developer's git
-    /// configuration. Mirrors what create_test_repo does for its first commit.
-    fn git_commit(repo_path: &std::path::Path, message: &str) {
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(repo_path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", message])
-            .current_dir(repo_path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "test@test.com")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "test@test.com")
-            .output()
-            .unwrap();
-    }
-
     /// Helper to create a git repo in a temp directory with an initial commit
     fn create_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmpdir = tempfile::tempdir().unwrap();

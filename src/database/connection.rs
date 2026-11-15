@@ -8380,6 +8380,34 @@ impl DatabaseManager {
         Ok(commits)
     }
 
+    /// Remove commits by SHA from git_commits. Used to undo the commit rows a
+    /// failed indexing run recorded: those rows make later runs treat the
+    /// commits as already indexed and skip them.
+    pub async fn remove_git_commits(&self, shas: &[String]) -> Result<()> {
+        if shas.is_empty() {
+            return Ok(());
+        }
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+
+        // One chunked predicate per call keeps the SQL string bounded on
+        // large diffs; SHAs are hex so quoting is belt-and-braces only.
+        for chunk in shas.chunks(500) {
+            let escaped: Vec<String> = chunk
+                .iter()
+                .map(|sha| format!("'{}'", sha.replace("'", "''")))
+                .collect();
+            let filter = format!("git_sha IN ({})", escaped.join(", "));
+            table.delete(&filter).await?;
+        }
+
+        tracing::info!(
+            "remove_git_commits: removed up to {} commit rows",
+            shas.len()
+        );
+        Ok(())
+    }
+
     /// Query commits by a chunk of SHAs with post-processing filters
     /// Regex and symbol filtering are done in Rust code after fetching SHA-filtered results
     /// This avoids complex SQL operations while still reducing the dataset via SHA filtering

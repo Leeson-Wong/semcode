@@ -229,8 +229,11 @@ async fn index_current_commit_if_needed(
     )
     .await
     {
-        Ok(()) => {
-            println!("Indexing complete");
+        Ok(stats) => {
+            println!(
+                "Indexing complete ({} files, {} functions, {} types)",
+                stats.files_processed, stats.functions_count, stats.types_count
+            );
         }
         Err(e) => {
             // If git range processing fails (e.g., root commit with no parent), just warn
