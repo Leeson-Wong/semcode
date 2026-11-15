@@ -1346,13 +1346,31 @@ async fn mcp_show_commit_range(
         }
     }
 
+    // The display below only lists commits that are indexed in the
+    // database, so the count must come from the database too — the live
+    // git walk count would overstate what can be shown.
+    let indexed_count = db.count_indexed_commits(&range_commits).await.unwrap_or(0);
     writeln!(
         buffer,
-        "\nGit Range: Found {} commit(s) in range {}:",
+        "\nGit Range: {} of {} commit(s) in range {} are indexed:",
+        indexed_count,
         range_commits.len(),
         range
     )?;
     writeln!(buffer, "{}", "=".repeat(80))?;
+    if indexed_count < range_commits.len() {
+        writeln!(
+            buffer,
+            "Note: {} commit(s) in this range are not indexed yet and cannot be shown or matched by filters.",
+            range_commits.len() - indexed_count
+        )?;
+        writeln!(
+            buffer,
+            "Backfill history with: semcode-index --source <repo> --git {} --vectors",
+            range
+        )?;
+        writeln!(buffer, "{}", "=".repeat(80))?;
+    }
 
     // Step 3: Process commits in chunks of 256 with database-level filtering
     const CHUNK_SIZE: usize = 256;
@@ -1525,9 +1543,12 @@ async fn mcp_show_commit_range(
     if !params.regex_patterns.is_empty()
         || !params.symbol_patterns.is_empty()
         || !params.path_patterns.is_empty()
+        || !params.author_patterns.is_empty()
+        || !params.subject_patterns.is_empty()
     {
         writeln!(buffer, "Summary:")?;
         writeln!(buffer, "  Total commits in range: {}", range_commits.len())?;
+        writeln!(buffer, "  Indexed commits in range: {}", indexed_count)?;
         writeln!(buffer, "  Matched by filters: {}", matched_count)?;
         writeln!(buffer, "  Displayed: {}", displayed_count)?;
 
@@ -1560,10 +1581,30 @@ async fn mcp_show_commit_range(
                     params.path_patterns.len(),
                     params.path_patterns.join(", ")
                 )?;
+            } else if !params.author_patterns.is_empty() {
+                writeln!(
+                    buffer,
+                    "\nInfo: No commits matched ANY of {} author pattern(s): {}",
+                    params.author_patterns.len(),
+                    params.author_patterns.join(", ")
+                )?;
+            } else if !params.subject_patterns.is_empty() {
+                writeln!(
+                    buffer,
+                    "\nInfo: No commits matched ANY of {} subject pattern(s): {}",
+                    params.subject_patterns.len(),
+                    params.subject_patterns.join(", ")
+                )?;
             }
         }
     } else {
-        writeln!(buffer, "Summary: Total: {} commits", displayed_count)?;
+        writeln!(
+            buffer,
+            "Summary: Displayed {} of {} commit(s) in range ({} indexed)",
+            displayed_count,
+            range_commits.len(),
+            indexed_count
+        )?;
     }
 
     Ok(String::from_utf8_lossy(&buffer).to_string())
@@ -2515,7 +2556,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "find_callers" => Some(json!({
             "name": "find_callers",
-            "description": "Find all functions that call a specific function, optionally at a specific git commit or branch, and optionally scoped to one architecture",
+            "description": "Find all functions that call a specific function, optionally at a specific git commit or branch, and optionally scoped to one architecture. Call sites are resolved by name, so same-named functions in unrelated files (common in C) can appear as callers; check the file paths in results to judge relevance.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2596,7 +2637,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "find_calls" => Some(json!({
             "name": "find_calls",
-            "description": "Find all functions called by a specific function, optionally at a specific git commit or branch, and optionally scoped to one architecture",
+            "description": "Find all functions called by a specific function, optionally at a specific git commit or branch, and optionally scoped to one architecture. Call sites are resolved by name, so entries with the same name in unrelated files (common in C) may not be the definition you mean; check file paths to judge relevance.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2629,7 +2670,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "find_callchain" => Some(json!({
             "name": "find_callchain",
-            "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit or branch, and optionally scoped to one architecture",
+            "description": "Show the complete call chain (both forward and reverse) for a function, optionally at a specific git commit or branch, and optionally scoped to one architecture. Edges are resolved by name, so same-named functions in unrelated files (common in C) can appear in the chain; check file paths to judge relevance.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2891,7 +2932,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "lore_search" => Some(json!({
             "name": "lore_search",
-            "description": "Search lore.kernel.org email archives with regex filters. Supports multiple field filters (from, subject, body, symbols, recipients) with OR logic within each field and AND logic across fields. Can show full threads. Results can be paginated with 50 lines per page. Same functionality as query tool's 'lore' command.",
+            "description": "Search lore.kernel.org email archives with regex filters. Supports multiple field filters (from, subject, body, symbols, recipients) with OR logic within each field and AND logic across fields. Can show full threads. Results can be paginated with 50 lines per page. Same functionality as query tool's 'lore' command. Kernel-projects only: answers exclusively from lore.kernel.org mailing-list archives ingested into this database (semcode-index --lore); non-kernel projects have no such data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2968,7 +3009,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "dig" => Some(json!({
             "name": "dig",
-            "description": "Search for lore.kernel.org emails related to a git commit. Orders results by date (newest first). Same functionality as query tool's 'dig' command.",
+            "description": "Search for lore.kernel.org emails related to a git commit. Orders results by date (newest first). Same functionality as query tool's 'dig' command. Kernel-projects only: answers exclusively from lore.kernel.org mailing-list archives ingested into this database (semcode-index --lore); non-kernel projects have no such data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3015,7 +3056,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "vlore_similar_emails" => Some(json!({
             "name": "vlore_similar_emails",
-            "description": "Search lore.kernel.org emails similar to the provided text using semantic vector embeddings. Requires lore vectors to be generated first. Supports filtering by from address, subject, body, symbols, and recipients patterns. Results can be paginated with 50 lines per page.",
+            "description": "Search lore.kernel.org emails similar to the provided text using semantic vector embeddings. Requires lore vectors to be generated first. Supports filtering by from address, subject, body, symbols, and recipients patterns. Results can be paginated with 50 lines per page. Kernel-projects only: answers exclusively from lore.kernel.org mailing-list archives ingested into this database (semcode-index --lore); non-kernel projects have no such data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3082,13 +3123,17 @@ fn get_tool_schema(name: &str) -> Option<Value> {
         })),
         "index_project" => Some(json!({
             "name": "index_project",
-            "description": "Trigger (re)indexing of the project's current commit in the background: source extraction and, optionally, vector generation for semantic search. Returns immediately; poll indexing_status for progress. Only one indexing run per database at a time.",
+            "description": "Trigger (re)indexing of the project's current commit in the background: source extraction and, optionally, vector generation for semantic search. Returns immediately; poll indexing_status for progress. Only one indexing run per database at a time. By default only new commits since the last run are indexed; pass full=true to walk the whole tree, which is what picks up a newly supported language's files on an existing index.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "vectors": {
                         "type": "boolean",
                         "description": "Also generate vectors for semantic search (vgrep). Default true. Slower on large repositories; requires the embedding model to be available."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "description": "Index the entire tree at the current commit instead of only new commits. Slower; needed to pick up files an earlier index skipped (e.g. after a new language is supported). Default false."
                     }
                 }
             }
@@ -3608,14 +3653,35 @@ impl McpServer {
         let result = match semcode::git::get_git_sha(workspace) {
             Ok(Some(git_sha)) => {
                 // Current HEAD: the working copy represents it, so
-                // candidate-level checks answer with no eager scan.
-                semcode::file_survey::survey_file_json_with_references(
+                // candidate-level checks answer with no eager scan. The
+                // reference enrichment carries its own time budget and a
+                // distinctive error; exceeding it degrades to the
+                // syntactic survey rather than failing the tool.
+                match semcode::file_survey::survey_file_json_with_references(
                     workspace,
                     std::path::Path::new(path),
                     &self.db,
                     &git_sha,
                 )
                 .await
+                {
+                    Ok(output) => Ok(output),
+                    Err(e) if e.to_string().contains(
+                        semcode::REFERENCE_SCAN_BUDGET_EXCEEDED,
+                    ) =>
+                    {
+                        semcode::file_survey::survey_file_json(
+                            workspace,
+                            std::path::Path::new(path),
+                        )
+                        .map(|output| {
+                            format!(
+                                "{output}\nNote: reference counts omitted — the index is too large for the per-call scan budget (30s)."
+                            )
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Ok(None) => {
                 semcode::file_survey::survey_file_json(workspace, std::path::Path::new(path))
@@ -4082,9 +4148,9 @@ impl McpServer {
             verbose
         );
 
-        // Note: We need git_repo_path for reachability checks
-        // Get it from the database manager or discover from current directory
-        let git_repo_path = "."; // MCP server typically runs in the repo directory
+        // Use the --git-repo path: the server's CWD is not necessarily
+        // the indexed repository (e.g. launched with an explicit -d).
+        let git_repo_path = self.git_repo_path.as_str();
 
         // Check if git_range is provided
         if let Some(range) = git_range {
@@ -4234,9 +4300,9 @@ impl McpServer {
             limit
         );
 
-        // Note: We need git_repo_path for git range resolution and reachability checks
-        // Get it from the database manager or discover from current directory
-        let git_repo_path = "."; // MCP server typically runs in the repo directory
+        // Use the --git-repo path: the server's CWD is not necessarily
+        // the indexed repository (e.g. launched with an explicit -d).
+        let git_repo_path = self.git_repo_path.as_str();
 
         let params = VCommitParams {
             query_text,
@@ -4266,6 +4332,13 @@ impl McpServer {
     }
 
     async fn handle_lore_search(&self, args: &Value) -> Value {
+        if !self.db.has_lore_emails().await.unwrap_or(false) {
+            return json!({
+                "content": [{"type": "text", "text":
+                    "No lore.kernel.org mailing-list data in this database. This tool searches kernel mailing list archives that must be ingested separately (semcode-index --lore <lists>, e.g. --lore bpf,netdev); it is not applicable to projects without kernel lore traffic."
+                }]
+            });
+        }
         let verbose = args["verbose"].as_bool().unwrap_or(false) as usize; // Convert to usize for function signature
         let show_thread = args["show_thread"].as_bool().unwrap_or(false);
         let show_replies = args["show_replies"].as_bool().unwrap_or(false);
@@ -4422,6 +4495,13 @@ impl McpServer {
     }
 
     async fn handle_dig(&self, args: &Value) -> Value {
+        if !self.db.has_lore_emails().await.unwrap_or(false) {
+            return json!({
+                "content": [{"type": "text", "text":
+                    "No lore.kernel.org mailing-list data in this database. This tool correlates commits with kernel mailing list discussions that must be ingested separately (semcode-index --lore <lists>, e.g. --lore bpf,netdev); it is not applicable to projects without kernel lore traffic."
+                }]
+            });
+        }
         let commit = args["commit"].as_str().unwrap_or("");
         let verbose = args["verbose"].as_bool().unwrap_or(false) as usize;
         let show_all = args["show_all"].as_bool().unwrap_or(false);
@@ -4473,7 +4553,7 @@ impl McpServer {
             until_date.as_deref().unwrap_or("")
         );
 
-        let git_repo_path = "."; // MCP server typically runs in the repo directory
+        let git_repo_path = self.git_repo_path.as_str();
 
         let params = DigLoreParams {
             commit_ish: commit,
@@ -4500,6 +4580,13 @@ impl McpServer {
     }
 
     async fn handle_vlore_similar_emails(&self, args: &Value) -> Value {
+        if !self.db.has_lore_emails().await.unwrap_or(false) {
+            return json!({
+                "content": [{"type": "text", "text":
+                    "No lore.kernel.org mailing-list data in this database. This tool finds emails semantically similar to a query within kernel mailing list archives that must be ingested separately (semcode-index --lore <lists>, e.g. --lore bpf,netdev); it is not applicable to projects without kernel lore traffic."
+                }]
+            });
+        }
         let query_text = args["query_text"].as_str().unwrap_or("");
 
         // Extract from_patterns array
@@ -4710,6 +4797,7 @@ impl McpServer {
 
     async fn handle_index_project(&self, args: &Value) -> Value {
         let vectors = args["vectors"].as_bool().unwrap_or(true);
+        let full = args["full"].as_bool().unwrap_or(false);
 
         // One indexing run per database at a time. The guard is best-effort:
         // the startup auto-index sets InProgress only once it starts
@@ -4748,6 +4836,7 @@ impl McpServer {
                 db,
                 git_repo,
                 vectors,
+                full,
                 model_path,
                 indexing_state,
                 notification_tx,
@@ -5075,8 +5164,14 @@ async fn vgrep_json_results(
     let vectorizer = CodeVectorizer::new_with_config(false, model_path.clone()).await?;
     let query_vector = vectorizer.vectorize_code(query_text)?;
 
-    // When path filtering, over-fetch then filter down, same as the text path.
-    let search_limit = if path_pattern.is_some() { 1000 } else { limit };
+    // Over-fetch on every path: the join from vectors to function rows can
+    // drop nearest neighbours whose hash no longer matches a row, so asking
+    // for exactly `limit` can silently return fewer.
+    let search_limit = if path_pattern.is_some() {
+        1000
+    } else {
+        (limit * 3).max(limit + 10)
+    };
     let matches = db
         .search_similar_functions_with_scores(&query_vector, search_limit, None)
         .await?;
@@ -5089,7 +5184,7 @@ async fn vgrep_json_results(
             .take(limit)
             .collect()
     } else {
-        matches
+        matches.into_iter().take(limit).collect()
     };
 
     let results: Vec<Value> = final_matches
@@ -5113,10 +5208,20 @@ async fn vgrep_json_results(
         })
         .collect();
 
-    Ok(json!({
+    let mut response = json!({
         "query_text": query_text,
         "results": results,
-    }))
+    });
+    if let Some(short_by) = limit.checked_sub(final_matches.len()) {
+        if short_by > 0 {
+            response["note"] = json!(format!(
+                "returned {} of {} requested; some nearest vectors matched no current function rows",
+                final_matches.len(),
+                limit
+            ));
+        }
+    }
+    Ok(response)
 }
 
 async fn mcp_grep_function_bodies(
@@ -6335,6 +6440,7 @@ async fn run_index_project(
     db_manager: Arc<DatabaseManager>,
     git_repo: String,
     vectors: bool,
+    full: bool,
     model_path: Option<String>,
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
     notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
@@ -6410,22 +6516,54 @@ async fn run_index_project(
     send_notification("Semcode: index_project - indexing source".to_string());
 
     let repo_path = PathBuf::from(&git_repo);
-    let git_range = format!("{}^..{}", git_sha, git_sha);
     let extensions_vec = semcode::file_extensions::supported_extensions();
 
-    let range_result = semcode::git_range::process_git_range(
-        &repo_path,
-        &git_range,
-        &extensions_vec,
-        db_manager.clone(),
-        false,
-        4,
-        &[],
-    )
-    .await;
+    // A full walk reads every file the tree has against what the index
+    // already recorded, which is what picks up a newly supported
+    // language's files; the default range only reads new commits.
+    let processed_before = if full {
+        db_manager.count_processed_files().await.unwrap_or(0)
+    } else {
+        0
+    };
+    let range_result = if full {
+        semcode::git_range::process_git_tree(
+            &repo_path,
+            &git_sha,
+            &extensions_vec,
+            db_manager.clone(),
+            false,
+            4,
+            &[],
+        )
+        .await
+        .map(|()| 0usize)
+    } else {
+        let git_range = format!("{}^..{}", git_sha, git_sha);
+        semcode::git_range::process_git_range(
+            &repo_path,
+            &git_range,
+            &extensions_vec,
+            db_manager.clone(),
+            false,
+            4,
+            &[],
+        )
+        .await
+        .map(|stats| stats.files_processed)
+    };
     let files_processed = match &range_result {
-        Ok(stats) => stats.files_processed,
+        Ok(files) => *files,
         Err(_) => 0,
+    };
+    let files_processed = if full {
+        db_manager
+            .count_processed_files()
+            .await
+            .map(|after| after.saturating_sub(processed_before))
+            .unwrap_or(files_processed)
+    } else {
+        files_processed
     };
     if let Err(e) = range_result {
         // Undo the commit rows this run added: they would make later runs

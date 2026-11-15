@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::CallRelationship;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use colored::*;
@@ -159,6 +159,15 @@ pub enum LoreIdState {
     /// A batch has claimed the id and its append has not finished.
     Pending,
 }
+
+/// Distinctive error text for a reference-count scan that outlived its
+/// budget, so callers can degrade to an answer without the counts
+/// instead of surfacing a failure.
+pub const REFERENCE_SCAN_BUDGET_EXCEEDED: &str = "reference-count scan exceeded its time budget";
+
+/// How long one reference-count scan may run. Counting referrers of
+/// arbitrary names has no index today, so the scan is bounded instead.
+const REFERENCE_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct DatabaseManager {
     connection: Connection,
@@ -950,6 +959,25 @@ impl DatabaseManager {
         }
 
         Ok(output)
+    }
+
+    /// Whether any lore.kernel.org mailing-list emails are stored. The
+    /// lore tools answer from this table only; projects indexed without
+    /// lore ingestion have none, and callers should say so instead of
+    /// returning empty search results.
+    pub async fn has_lore_emails(&self) -> Result<bool> {
+        let table_names = self.connection.table_names().execute().await?;
+        if !table_names.iter().any(|n| n == "lore") {
+            return Ok(false);
+        }
+        let count = self
+            .connection
+            .open_table("lore")
+            .execute()
+            .await?
+            .count_rows(None)
+            .await?;
+        Ok(count > 0)
     }
 
     /// Drop and recreate a specific table
@@ -3425,6 +3453,12 @@ impl DatabaseManager {
         self.function_store.count_all().await
     }
 
+    /// Count every file marked processed, so a caller can measure what a
+    /// full-tree run added.
+    pub async fn count_processed_files(&self) -> Result<usize> {
+        self.processed_file_store.count().await
+    }
+
     /// Count all typedefs without resolving content - much faster for counts
     pub async fn count_typedefs(&self) -> Result<usize> {
         self.typedef_store.count_all().await
@@ -3755,6 +3789,13 @@ impl DatabaseManager {
     )> {
         use std::collections::{HashMap, HashSet};
 
+        // The scans below read every relationship row the index holds, so
+        // on large indexes one call runs for minutes. The deadline is
+        // checked between batches — synchronous, because a long Arrow
+        // stretch inside one poll starves any async timer — and the
+        // distinctive error lets callers degrade instead of waiting.
+        let deadline = std::time::Instant::now() + REFERENCE_SCAN_BUDGET;
+
         let function_targets: HashSet<String> = function_names.iter().cloned().collect();
         let type_targets: HashSet<String> = type_names.iter().cloned().collect();
         let mut function_referrers: HashMap<String, HashSet<String>> = HashMap::new();
@@ -3769,7 +3810,7 @@ impl DatabaseManager {
                 (true, false) => "types IS NOT NULL",
                 (true, true) => unreachable!(),
             };
-            let batches = functions_table
+            let mut batches = functions_table
                 .query()
                 .only_if(relationship_filter)
                 .select(lancedb::query::Select::Columns(vec![
@@ -3781,11 +3822,13 @@ impl DatabaseManager {
                     "types".to_string(),
                 ]))
                 .execute()
-                .await?
-                .try_collect::<Vec<_>>()
                 .await?;
+            use futures::TryStreamExt;
 
-            for batch in batches {
+            while let Some(batch) = batches.try_next().await? {
+                if std::time::Instant::now() > deadline {
+                    bail!(REFERENCE_SCAN_BUDGET_EXCEEDED);
+                }
                 let names: &StringArray = super::get_column(&batch, "name")?;
                 let paths: &StringArray = super::get_column(&batch, "file_path")?;
                 let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
@@ -3837,7 +3880,7 @@ impl DatabaseManager {
 
             if !type_targets.is_empty() {
                 let types_table = self.connection.open_table("types").execute().await?;
-                let batches = types_table
+                let mut batches = types_table
                     .query()
                     .only_if("types IS NOT NULL")
                     .select(lancedb::query::Select::Columns(vec![
@@ -3848,11 +3891,12 @@ impl DatabaseManager {
                         "types".to_string(),
                     ]))
                     .execute()
-                    .await?
-                    .try_collect::<Vec<_>>()
                     .await?;
 
-                for batch in batches {
+                while let Some(batch) = batches.try_next().await? {
+                    if std::time::Instant::now() > deadline {
+                        bail!(REFERENCE_SCAN_BUDGET_EXCEEDED);
+                    }
                     let names: &StringArray = super::get_column(&batch, "name")?;
                     let paths: &StringArray = super::get_column(&batch, "file_path")?;
                     let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
@@ -8406,6 +8450,39 @@ impl DatabaseManager {
             shas.len()
         );
         Ok(())
+    }
+
+    /// Count how many of the given SHAs are present in git_commits.
+    /// Single-column projection keeps this light even for large ranges.
+    pub async fn count_indexed_commits(&self, shas: &[String]) -> Result<usize> {
+        use futures::TryStreamExt;
+
+        if shas.is_empty() {
+            return Ok(0);
+        }
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+
+        let mut count = 0usize;
+        for chunk in shas.chunks(500) {
+            let escaped: Vec<String> = chunk
+                .iter()
+                .map(|sha| format!("'{}'", sha.replace("'", "''")))
+                .collect();
+            let filter = format!("git_sha IN ({})", escaped.join(", "));
+            let batches = table
+                .query()
+                .only_if(filter)
+                .select(lancedb::query::Select::Columns(vec!["git_sha".to_string()]))
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            for batch in batches {
+                count += batch.num_rows();
+            }
+        }
+        Ok(count)
     }
 
     /// Query commits by a chunk of SHAs with post-processing filters

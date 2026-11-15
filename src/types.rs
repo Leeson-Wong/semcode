@@ -475,11 +475,12 @@ impl ChosenDefinition {
                 .find_map(|site| site.qualifier.as_deref().map(remedy))
         })?;
         Some(format!(
-            "'{}' has {} owners in this revision. This answer is about {} at \
+            "'{}' has {} owners ({} same-named definitions) in this revision. This answer is about {} at \
              {}:{}{}; the others are {}. Which one a call site reaches depends \
              on the path it writes; ask for `{}` to name one.",
             self.function.name,
             owners.len(),
+            sites.len() + 1,
             qualified_name(&self.function.name, self.function.qualifier.as_deref()),
             self.function.file_path,
             self.function.line_start,

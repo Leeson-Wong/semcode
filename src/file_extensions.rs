@@ -6,19 +6,20 @@
 /// to ensure consistency across the codebase.
 /// All supported file extensions for code analysis (without leading dot)
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "c",   // C source files
-    "h",   // C/C++ header files
-    "cc",  // C++ source files
-    "cpp", // C++ source files
-    "cxx", // C++ source files
-    "c++", // C++ source files
-    "hh",  // C++ header files
-    "hpp", // C++ header files
-    "hxx", // C++ header files
-    "h++", // C++ header files
-    "rs",  // Rust source files
-    "py",  // Python source files
-    "zig", // Zig source files
+    "c",    // C source files
+    "h",    // C/C++ header files
+    "cc",   // C++ source files
+    "cpp",  // C++ source files
+    "cxx",  // C++ source files
+    "c++",  // C++ source files
+    "hh",   // C++ header files
+    "hpp",  // C++ header files
+    "hxx",  // C++ header files
+    "h++",  // C++ header files
+    "rs",   // Rust source files
+    "py",   // Python source files
+    "zig",  // Zig source files
+    "java", // Java source files
 ];
 
 /// Default extensions for indexing (subset of SUPPORTED_EXTENSIONS)

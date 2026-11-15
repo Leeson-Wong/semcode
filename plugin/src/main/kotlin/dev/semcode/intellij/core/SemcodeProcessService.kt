@@ -52,9 +52,9 @@ class SemcodeProcessService(private val project: Project) : Disposable {
             return false
         }
         val db = databaseDir()
-        // semcode 默认扩展只有 c,h,rs,zig；C/C++ 全家（cpp/hpp/cc…）与 py 需显式开。
+        // semcode 默认扩展只有 c,h,rs,zig；C/C++ 全家（cpp/hpp/cc…）、py、java 需显式开。
         // TODO(v1.4): 改为从 semcode 查询支持列表（数据驱动，ArkTS 接入时零改动）
-        val extensions = "c,h,cc,cpp,cxx,c++,hh,hpp,hxx,h++,rs,py,zig"
+        val extensions = "c,h,cc,cpp,cxx,c++,hh,hpp,hxx,h++,rs,py,zig,java"
         val steps = listOf(
             "semcode-index (source)" to listOf(
                 bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "-e", extensions,

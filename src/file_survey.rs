@@ -25,6 +25,7 @@ enum SurveyLanguage {
     Rust,
     Python,
     Zig,
+    Java,
 }
 
 impl SurveyLanguage {
@@ -36,6 +37,7 @@ impl SurveyLanguage {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
             "zig" => Some(Self::Zig),
+            "java" => Some(Self::Java),
             _ => None,
         }
     }
@@ -76,7 +78,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
     }
     if !is_supported_for_analysis(path.to_string_lossy().as_ref()) {
         bail!(
-            "unsupported source file '{}'; expected C, C++, Rust, Python, or Zig",
+            "unsupported source file '{}'; expected C, C++, Rust, Python, Zig, or Java",
             path.display()
         );
     }
@@ -91,6 +93,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
         SurveyLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
         SurveyLanguage::Python => tree_sitter_python::LANGUAGE.into(),
         SurveyLanguage::Zig => tree_sitter_zig::LANGUAGE.into(),
+        SurveyLanguage::Java => tree_sitter_java::LANGUAGE.into(),
     };
     parser.set_language(&grammar)?;
     let tree = parser
@@ -257,6 +260,19 @@ fn is_basic_type(language: SurveyLanguage, name: &str) -> bool {
             "None" | "bool" | "int" | "float" | "complex" | "str" | "bytes" | "bytearray"
         ),
         SurveyLanguage::Zig => is_zig_basic_type(name),
+        SurveyLanguage::Java => matches!(
+            name,
+            "boolean"
+                | "byte"
+                | "short"
+                | "int"
+                | "long"
+                | "char"
+                | "float"
+                | "double"
+                | "void"
+                | "var"
+        ),
     }
 }
 
@@ -322,6 +338,7 @@ fn walk(node: Node<'_>, source: &[u8], language: SurveyLanguage, out: &mut Surve
         SurveyLanguage::Rust => extract_rust(node, source, out),
         SurveyLanguage::Python => extract_python(node, source, out),
         SurveyLanguage::Zig => extract_zig(node, source, out),
+        SurveyLanguage::Java => extract_java(node, source, out),
     }
 
     let mut cursor = node.walk();
@@ -446,6 +463,67 @@ fn extract_python(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
             }
         }
         "type" => {
+            if let Some(value) = text(node, source) {
+                increment(&mut out.types_mentioned, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_java(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
+    match node.kind() {
+        "method_declaration" | "constructor_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.functions_defined.push((name, line(node)));
+            }
+        }
+        "method_invocation" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                increment(&mut out.calls, name);
+            }
+        }
+        "object_creation_expression" => {
+            if let Some(name) = node
+                .child_by_field_name("type")
+                .and_then(|n| text(n, source))
+            {
+                increment(&mut out.calls, name);
+            }
+        }
+        "class_declaration" | "record_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.types_defined
+                    .push((format!("class {name}"), line(node)));
+            }
+        }
+        "enum_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.types_defined.push((format!("enum {name}"), line(node)));
+            }
+        }
+        "interface_declaration" | "annotation_type_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.types_defined
+                    .push((format!("interface {name}"), line(node)));
+            }
+        }
+        "type_identifier" => {
             if let Some(value) = text(node, source) {
                 increment(&mut out.types_mentioned, value);
             }

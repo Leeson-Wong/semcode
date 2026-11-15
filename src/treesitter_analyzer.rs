@@ -45,6 +45,7 @@ pub enum Language {
     Rust,
     Python,
     Zig,
+    Java,
 }
 
 /// Shared extraction logic: queries, tag encoding, qualifier and guard
@@ -61,6 +62,7 @@ pub const TREE_SITTER_CPP_VERSION: &str = "0.23.4";
 pub const TREE_SITTER_PYTHON_VERSION: &str = "0.25.0";
 pub const TREE_SITTER_RUST_VERSION: &str = "0.24.2";
 pub const TREE_SITTER_ZIG_VERSION: &str = "1.1.2";
+pub const TREE_SITTER_JAVA_VERSION: &str = "0.23.5";
 
 /// The extractor version that reads a language: shared logic plus the
 /// grammar that language parses through.
@@ -71,6 +73,7 @@ pub fn extractor_version(language: Language) -> String {
         Language::Python => format!("tree-sitter-python-{TREE_SITTER_PYTHON_VERSION}"),
         Language::Rust => format!("tree-sitter-rust-{TREE_SITTER_RUST_VERSION}"),
         Language::Zig => format!("tree-sitter-zig-{TREE_SITTER_ZIG_VERSION}"),
+        Language::Java => format!("tree-sitter-java-{TREE_SITTER_JAVA_VERSION}"),
     };
     format!("{EXTRACTOR_VERSION}+{grammar}")
 }
@@ -85,6 +88,7 @@ pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
         Language::Rust,
         Language::Python,
         Language::Zig,
+        Language::Java,
     ]
     .into_iter()
     .map(|language| (language, extractor_version(language)))
@@ -125,6 +129,7 @@ impl Language {
                 "rs" => Some(Language::Rust),
                 "py" => Some(Language::Python),
                 "zig" => Some(Language::Zig),
+                "java" => Some(Language::Java),
                 _ => None,
             })
     }
@@ -479,11 +484,13 @@ pub struct TreeSitterAnalyzer {
     rust_parser: Parser,
     python_parser: Parser,
     zig_parser: Parser,
+    java_parser: Parser,
     c_queries: &'static LanguageQueries,
     cpp_queries: &'static LanguageQueries,
     rust_queries: &'static LanguageQueries,
     python_queries: &'static LanguageQueries,
     zig_queries: &'static LanguageQueries,
+    java_queries: &'static LanguageQueries,
     /// Read `.h` files as C++ instead of the default C. Per-index state,
     /// recorded in `schema_meta` when the index is built; off everywhere
     /// else, including every test.
@@ -536,6 +543,11 @@ impl TreeSitterAnalyzer {
         let mut zig_parser = Parser::new();
         zig_parser.set_language(&zig_language)?;
 
+        // Initialize Java parser and queries
+        let java_language = tree_sitter_java::LANGUAGE.into();
+        let mut java_parser = Parser::new();
+        java_parser.set_language(&java_language)?;
+
         // Compiled once for the process, not once per analyzer: see
         // c_queries() below.
         let c_queries = Self::c_queries()?;
@@ -543,6 +555,7 @@ impl TreeSitterAnalyzer {
         let rust_queries = Self::rust_queries()?;
         let python_queries = Self::python_queries()?;
         let zig_queries = Self::zig_queries()?;
+        let java_queries = Self::java_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
@@ -550,11 +563,13 @@ impl TreeSitterAnalyzer {
             rust_parser,
             python_parser,
             zig_parser,
+            java_parser,
             c_queries,
             cpp_queries,
             rust_queries,
             python_queries,
             zig_queries,
+            java_queries,
             headers_as_cpp: false,
         })
     }
@@ -646,6 +661,18 @@ impl TreeSitterAnalyzer {
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("Zig queries: {e}"))
+    }
+
+    fn java_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_java_queries(&tree_sitter_java::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("Java queries: {e}"))
     }
 
     fn create_c_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
@@ -1508,6 +1535,133 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    fn create_java_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // Methods carry a type field; constructors do not, so a
+        // constructor's name doubles as its return type (a constructor
+        // yields an instance of its class). The type is spelled with
+        // unnamed tokens for primitives ("void", "int", ...), so the
+        // pattern enumerates them beside the named type nodes — `(_)`
+        // cannot match an unnamed token. Methods without a body —
+        // abstract, native, interface signatures — do not match and are
+        // not indexed, matching the Python treatment of body-less defs.
+        let function_query = Query::new(
+            language,
+            r#"
+            (method_declaration
+                type: [
+                    (type_identifier)
+                    (scoped_type_identifier)
+                    (generic_type)
+                    (array_type)
+                    (void_type)
+                    (integral_type)
+                    (boolean_type)
+                    (floating_point_type)
+                ] @return_type
+                name: (identifier) @function_name
+                parameters: (formal_parameters) @parameters
+                body: (block) @body
+            ) @function
+
+            (constructor_declaration
+                name: (identifier) @function_name @return_type
+                parameters: (formal_parameters) @parameters
+                body: (constructor_body) @body
+            ) @function
+        "#,
+        )?;
+
+        let comment_query = Query::new(
+            language,
+            r#"
+            (line_comment) @comment
+            (block_comment) @comment
+        "#,
+        )?;
+
+        // Every type-shape declaration Java has. Records are classes for
+        // our purposes; annotation types are interfaces.
+        let type_query = Query::new(
+            language,
+            r#"
+            (class_declaration
+                name: (identifier) @type_name
+                body: (class_body) @body
+            ) @class
+
+            (record_declaration
+                name: (identifier) @type_name
+                body: (class_body) @body
+            ) @class
+
+            (enum_declaration
+                name: (identifier) @type_name
+                body: (enum_body) @body
+            ) @enum
+
+            (interface_declaration
+                name: (identifier) @type_name
+                body: (interface_body) @body
+            ) @interface
+
+            (annotation_type_declaration
+                name: (identifier) @type_name
+                body: (annotation_type_body) @body
+            ) @interface
+        "#,
+        )?;
+
+        // Annotations occupy the decorator slot, as in Python: they are
+        // read but never stored, because nothing about them is
+        // function-like and `expands_to_an_attribute` never fires.
+        let macro_query = Query::new(
+            language,
+            r#"
+            (marker_annotation
+                name: (identifier) @macro_name
+            ) @annotation
+
+            (annotation
+                name: (identifier) @macro_name
+            ) @annotation
+        "#,
+        )?;
+
+        // Every invocation contributes a name-level edge, qualified or
+        // not: that is the level the call graph resolves at, and a
+        // receiver-typed site the Java pass cannot resolve would only be
+        // noise. `this.x()` is the exception — the receiver names the
+        // enclosing class, so it earns a tagged edge. `new Foo()` names
+        // Foo's constructor, which is indexed under the class name.
+        let call_query = Query::new(
+            language,
+            r#"
+            (method_invocation
+                name: (identifier) @function_name
+            ) @call
+
+            (method_invocation
+                object: (_) @receiver
+                name: (identifier) @member_name
+                (#eq? @receiver "this")
+            ) @method_call
+
+            (object_creation_expression
+                type: (type_identifier) @function_name
+            ) @call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None, // Java doesn't have typedefs
+            macro_query,
+            call_query,
+        })
+    }
+
     fn create_zig_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
         // Named functions and tests. Anonymous `fn` types have no name field
         // and are left to the type query. `!body` is the extern/declaration
@@ -1645,6 +1799,7 @@ impl TreeSitterAnalyzer {
             Language::Rust => &mut self.rust_parser,
             Language::Python => &mut self.python_parser,
             Language::Zig => &mut self.zig_parser,
+            Language::Java => &mut self.java_parser,
         }
     }
 
@@ -1656,6 +1811,7 @@ impl TreeSitterAnalyzer {
             Language::Rust => self.rust_queries,
             Language::Python => self.python_queries,
             Language::Zig => self.zig_queries,
+            Language::Java => self.java_queries,
         }
     }
 
@@ -3437,7 +3593,7 @@ impl TreeSitterAnalyzer {
         let owner = qualifier?;
         let receiver = site.receiver_expr.as_deref()?;
         let is_self = match language {
-            Language::Cpp => receiver == "this",
+            Language::Cpp | Language::Java => receiver == "this",
             // `this`/`self` names the enclosing type (C++ class, Python
             // class, Rust impl), so the call resolves against a known owner
             // instead of falling through to the dispatch table, where a
@@ -4703,6 +4859,9 @@ impl TreeSitterAnalyzer {
                     Language::C | Language::Cpp => Self::guard_of(node, ctx.source),
                     Language::Python => Self::python_guard(node, ctx.source),
                     Language::Zig => Self::zig_guard(node, ctx.source),
+                    // Java has no conditional compilation; a method is
+                    // always compiled.
+                    Language::Java => None,
                 }),
                 qualifier,
             };
@@ -5003,6 +5162,16 @@ impl TreeSitterAnalyzer {
                     }
                     "class" => {
                         kind = "class".to_string();
+                        type_start_byte = node.start_byte();
+                        type_end_byte = node.end_byte();
+
+                        type_node = Some(node);
+                        if line_start == 0 {
+                            line_start = node.start_position().row as u32 + 1;
+                        }
+                    }
+                    "interface" => {
+                        kind = "interface".to_string();
                         type_start_byte = node.start_byte();
                         type_end_byte = node.end_byte();
 
@@ -5462,6 +5631,10 @@ impl TreeSitterAnalyzer {
     ) -> Vec<ParameterInfo> {
         if node.kind() == "parameters" {
             return Self::parse_zig_parameters(node, source);
+        }
+
+        if node.kind() == "formal_parameters" {
+            return Self::parse_java_parameters(node, source);
         }
 
         let mut parameters = Vec::new();
@@ -6741,8 +6914,61 @@ impl TreeSitterAnalyzer {
             Language::Cpp => Self::cpp_owner_qualifier(node, source),
             Language::Python => Self::python_owner_qualifier(node, source, file_path),
             Language::Zig => Self::zig_owner_qualifier(node, source, file_path),
+            Language::Java => Self::java_owner_qualifier(node, source),
             Language::C => None,
         }
+    }
+
+    /// The entity owning a Java definition: the declared package plus every
+    /// enclosing type, outermost first. The package comes from the AST, not
+    /// the file path — repository layouts (jdk17's
+    /// `src/java.base/share/classes/java/lang/String.java`) do not spell the
+    /// package, the source does.
+    fn java_owner_qualifier(defined_at: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut segments: Vec<String> = Vec::new();
+
+        let mut root = defined_at;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() != "package_declaration" {
+                continue;
+            }
+            if let Some(name) = child.named_child(0) {
+                if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                    segments.extend(text.split('.').map(str::to_string));
+                }
+            }
+            break;
+        }
+
+        let mut scopes = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            if matches!(
+                current.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) {
+                if let Some(name) = current.child_by_field_name("name") {
+                    if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                        scopes.push(text.to_string());
+                    }
+                }
+            }
+            parent = current.parent();
+        }
+        scopes.reverse();
+        segments.extend(scopes);
+        if segments.is_empty() {
+            return None;
+        }
+        Some(segments.join("."))
     }
 
     /// One predicate on one line: continuations go, comments go, and runs of
@@ -6881,6 +7107,72 @@ impl TreeSitterAnalyzer {
                 .child_by_field_name("type")
                 .map(|n| collapse_whitespace(&source[n.byte_range()]))
                 .unwrap_or_default();
+            if name.is_empty() && type_name.is_empty() {
+                continue;
+            }
+            parameters.push(ParameterInfo {
+                name,
+                type_name,
+                type_file_path: None,
+                type_git_file_hash: None,
+            });
+        }
+        parameters
+    }
+
+    /// Java parameters: `formal_parameter` (`int x`) and `spread_parameter`
+    /// (`String... args`). The name sits behind a declarator; generics and
+    /// array suffixes stay in the type text as written. A spread parameter
+    /// has no fields on its node, so its pieces are read positionally.
+    fn parse_java_parameters(node: tree_sitter::Node, source: &str) -> Vec<ParameterInfo> {
+        let mut parameters = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            let (name, type_name) = match child.kind() {
+                "formal_parameter" => {
+                    let type_name = child
+                        .child_by_field_name("type")
+                        .map(|n| collapse_whitespace(&source[n.byte_range()]))
+                        .unwrap_or_default();
+                    let name = child
+                        .child_by_field_name("declarator")
+                        .and_then(|d| d.child_by_field_name("name"))
+                        .or_else(|| child.child_by_field_name("name"))
+                        .map(|n| source[n.byte_range()].to_string())
+                        .unwrap_or_default();
+                    (name, type_name)
+                }
+                "spread_parameter" => {
+                    let mut cursor = child.walk();
+                    let mut name = String::new();
+                    let mut type_name = String::new();
+                    let mut varargs = false;
+                    for part in child.children(&mut cursor) {
+                        match part.kind() {
+                            "variable_declarator" => {
+                                name = part
+                                    .child_by_field_name("name")
+                                    .map(|n| source[n.byte_range()].to_string())
+                                    .unwrap_or_default();
+                            }
+                            "modifiers" => {}
+                            // The `...` is a bare token beside the element
+                            // type; keeping it spells the parameter as
+                            // written (`String...`).
+                            "..." => varargs = true,
+                            _ if type_name.is_empty() => {
+                                type_name = collapse_whitespace(&source[part.byte_range()]);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if varargs {
+                        type_name.push_str("...");
+                    }
+                    (name, type_name)
+                }
+                _ => continue,
+            };
             if name.is_empty() && type_name.is_empty() {
                 continue;
             }
@@ -10256,6 +10548,10 @@ test "helper ok" {
             Language::from_path(Path::new("src/main.rs")),
             Some(Language::Rust)
         );
+        assert_eq!(
+            Language::from_path(Path::new("src/main/App.java")),
+            Some(Language::Java)
+        );
     }
 
     #[test]
@@ -10441,6 +10737,7 @@ mod rust_receiver_tests {
             ("tree-sitter-python", TREE_SITTER_PYTHON_VERSION),
             ("tree-sitter-rust", TREE_SITTER_RUST_VERSION),
             ("tree-sitter-zig", TREE_SITTER_ZIG_VERSION),
+            ("tree-sitter-java", TREE_SITTER_JAVA_VERSION),
         ] {
             assert_eq!(
                 versions.get(krate).map(String::as_str),
@@ -10912,6 +11209,211 @@ mod rust_receiver_tests {
             ),
             "{:#?}",
             analysis.dispatch_sites
+        );
+    }
+
+    #[test]
+    fn java_definitions_carry_package_and_owner() {
+        // Java owners read the declared package from the AST — not the file
+        // path, which in jdk-style trees does not spell the package — and
+        // nest through every enclosing type: nested classes, enum and
+        // record methods, interface defaults. Constructors carry their
+        // class.
+        let source = "package com.example.app;\n\
+             \n\
+             public class Outer {\n\
+             \tprivate final int size;\n\
+             \n\
+             \tpublic Outer(int size) {\n\
+             \t\tthis.size = size;\n\
+             \t}\n\
+             \n\
+             \tpublic int getSize() {\n\
+             \t\treturn this.size;\n\
+             \t}\n\
+             \n\
+             \tstatic class Inner {\n\
+             \t\tvoid run() {}\n\
+             \t}\n\
+             \n\
+             \tinterface Hook {\n\
+             \t\tdefault void onStart() {}\n\
+             \t}\n\
+             \n\
+             \tenum Color {\n\
+             \t\tRED, GREEN;\n\
+             \n\
+             \t\tvoid describe() {}\n\
+             \t}\n\
+             \n\
+             \trecord Point(int x, int y) {\n\
+             \t\tint sum() { return x + y; }\n\
+             \t}\n\
+             }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                source,
+                std::path::Path::new("src/java.base/share/classes/com/example/app/Outer.java"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let mut found: Vec<(String, Option<String>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.qualifier.clone()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "Outer".to_string(),
+                    Some("com.example.app.Outer".to_string())
+                ),
+                (
+                    "describe".to_string(),
+                    Some("com.example.app.Outer.Color".to_string())
+                ),
+                (
+                    "getSize".to_string(),
+                    Some("com.example.app.Outer".to_string())
+                ),
+                (
+                    "onStart".to_string(),
+                    Some("com.example.app.Outer.Hook".to_string())
+                ),
+                (
+                    "run".to_string(),
+                    Some("com.example.app.Outer.Inner".to_string())
+                ),
+                (
+                    "sum".to_string(),
+                    Some("com.example.app.Outer.Point".to_string())
+                ),
+            ],
+            "{found:?}"
+        );
+        let mut type_names: Vec<(String, String)> = analysis
+            .types
+            .iter()
+            .map(|t| (t.name.clone(), t.kind.clone()))
+            .collect();
+        type_names.sort();
+        assert_eq!(
+            type_names,
+            vec![
+                ("Color".to_string(), "enum".to_string()),
+                ("Hook".to_string(), "interface".to_string()),
+                ("Inner".to_string(), "class".to_string()),
+                ("Outer".to_string(), "class".to_string()),
+                ("Point".to_string(), "class".to_string()),
+            ],
+            "{type_names:?}"
+        );
+    }
+
+    #[test]
+    fn java_methods_carry_params_calls_and_skip_bodyless_forms() {
+        // Every invocation names a callee at name level, `this.x()` adds
+        // its owner, `new Foo()` reaches the constructor row, annotations
+        // occupy the macro slot but store nothing, and body-less methods
+        // (abstract, interface signatures) are not indexed.
+        let source = "package com.example.app;\n\
+             \n\
+             import java.util.List;\n\
+             \n\
+             public class Service {\n\
+             \t@Override\n\
+             \tpublic String render(List<String> items, int[] counts, String... rest) {\n\
+             \t\tService other = new Service();\n\
+             \t\tother.refresh();\n\
+             \t\trefresh();\n\
+             \t\tlog(\"done\");\n\
+             \t\treturn this.format(items);\n\
+             \t}\n\
+             \n\
+             \tvoid refresh() {}\n\
+             \n\
+             \tString format(List<String> items) { return \"\"; }\n\
+             \n\
+             \tvoid log(String msg) {}\n\
+             \n\
+             \tabstract void fly();\n\
+             \n\
+             \tinterface Callback {\n\
+             \t\tvoid onEvent(String e);\n\
+             \n\
+             \t\tdefault void done() { }\n\
+             \t}\n\
+             }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                source,
+                std::path::Path::new("src/com/example/app/Service.java"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            analysis.macros.is_empty(),
+            "annotations must not be stored: {:?}",
+            analysis.macros
+        );
+        assert!(
+            !analysis.functions.iter().any(|f| f.name == "fly"),
+            "abstract methods have no body to index: {:?}",
+            analysis.functions
+        );
+        assert!(
+            !analysis.functions.iter().any(|f| f.name == "onEvent"),
+            "interface signatures have no body to index: {:?}",
+            analysis.functions
+        );
+        assert!(
+            analysis.functions.iter().any(|f| f.name == "done"),
+            "interface defaults have a body: {:?}",
+            analysis.functions
+        );
+
+        let render = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "render")
+            .unwrap();
+        assert_eq!(render.return_type, "String");
+        let mut params: Vec<(String, String)> = render
+            .parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.type_name.clone()))
+            .collect();
+        params.sort();
+        assert_eq!(
+            params,
+            vec![
+                ("counts".to_string(), "int[]".to_string()),
+                ("items".to_string(), "List<String>".to_string()),
+                ("rest".to_string(), "String...".to_string()),
+            ],
+            "{params:?}"
+        );
+
+        let mut calls = render.calls.clone().unwrap_or_default();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(
+            calls,
+            vec![
+                plain("Service"),
+                plain("format"),
+                plain("log"),
+                plain("refresh"),
+                tagged("format", "com.example.app.Service"),
+            ],
+            "{calls:?}"
         );
     }
 
