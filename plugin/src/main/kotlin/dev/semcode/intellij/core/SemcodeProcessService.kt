@@ -1,5 +1,6 @@
 package dev.semcode.intellij.core
 
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
@@ -9,15 +10,11 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 
 /**
- * semcode 进程门面。
- *
- * 集成约束（来源 dev/02-deveco-plugin.md，Windows 实测）：
- * 1. 索引器必须以工程根为 CWD、`-s .` 调用（相对路径 scope bug 绕开）
- * 2. 查询必须显式 `--git-repo <projectRoot>`
- * 3. 索引严格两步：`semcode-index -s .` 后 `semcode-index -s . --vectors`
+ * semcode 进程门面：索引走 CLI 两步链（CWD=工程根 + `-s .`，dev/02 约束 1、3），
+ * 查询走常驻 semcode-mcp JSON-RPC 子进程（库位置 .idea/semcode.db）。
  */
 @Service(Service.Level.PROJECT)
-class SemcodeProcessService(private val project: Project) {
+class SemcodeProcessService(private val project: Project) : Disposable {
 
     private val log = Logger.getInstance(SemcodeProcessService::class.java)
 
@@ -37,24 +34,38 @@ class SemcodeProcessService(private val project: Project) {
             semcodeExe(dir, "semcode").isFile &&
             semcodeExe(dir, "semcode-mcp").isFile
 
+    fun projectRoot(): File? = project.basePath?.let { File(it) }
+
+    /** 索引库目录：<project>/.idea/semcode.db（含旧位置迁移）。 */
+    fun databaseDir(): File = SemcodeProjectStore.databaseDir(project)
+
     /**
      * 链式跑两步索引。每步输出行回调 [onLine]（进度展示），全部成功返回 true。
      */
-    fun runIndexChain(projectRoot: File, onLine: (String) -> Unit): Boolean {
+    fun runIndexChain(onLine: (String) -> Unit): Boolean {
+        val root = projectRoot() ?: run {
+            onLine("ERROR: project has no base path")
+            return false
+        }
         val bins = resolveBinaries() ?: run {
             onLine("ERROR: semcode binaries not found — set them in Settings | Tools | Semcode")
             return false
         }
+        val db = databaseDir()
         // semcode 默认扩展只有 c,h,rs,zig；C/C++ 全家（cpp/hpp/cc…）与 py 需显式开。
-        // TODO(1.3): 改为从 semcode 查询支持列表（数据驱动，ArkTS 接入时零改动）
+        // TODO(v1.4): 改为从 semcode 查询支持列表（数据驱动，ArkTS 接入时零改动）
         val extensions = "c,h,cc,cpp,cxx,c++,hh,hpp,hxx,h++,rs,py,zig"
         val steps = listOf(
-            "semcode-index (source)" to listOf(bins.index.absolutePath, "-s", ".", "-e", extensions),
-            "semcode-index (vectors)" to listOf(bins.index.absolutePath, "-s", ".", "--vectors"),
+            "semcode-index (source)" to listOf(
+                bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "-e", extensions,
+            ),
+            "semcode-index (vectors)" to listOf(
+                bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "--vectors",
+            ),
         )
         for ((label, command) in steps) {
             onLine(">>> $label")
-            val ok = runProcess(command, projectRoot) { line -> onLine(line) }
+            val ok = runProcess(command, root) { line -> onLine(line) }
             if (!ok) {
                 onLine("ERROR: step failed: $label")
                 return false
@@ -63,31 +74,26 @@ class SemcodeProcessService(private val project: Project) {
         return true
     }
 
-    /**
-     * 单次查询（脚手架版：`semcode -q "<cmd>"` 文本输出）。
-     * 1.2 阶段替换为 semcode-mcp JSON-RPC 客户端。
-     */
-    fun runQuery(projectRoot: File, queryCommand: String, onLine: (String) -> Unit): Boolean {
-        val bins = resolveBinaries() ?: run {
-            onLine("ERROR: semcode binaries not found")
-            return false
+    /** 查询用常驻 MCP 子进程（懒启动，进程死亡自动重启）。 */
+    fun mcpClient(): SemcodeMcpClient? {
+        val root = projectRoot() ?: return null
+        val bins = resolveBinaries() ?: return null
+        if (client == null) {
+            val db = databaseDir()
+            client = SemcodeMcpClient(
+                listOf(
+                    bins.mcp.absolutePath,
+                    "-d", db.absolutePath,
+                    "--git-repo", root.absolutePath,
+                    "--lazy",
+                ),
+                root,
+            )
         }
-        val modelDir = SemcodeSettings.getInstance().modelDir
-        val command = buildList {
-            add(bins.query.absolutePath)
-            add("--database")
-            add(projectRoot.absolutePath)
-            add("--git-repo")
-            add(projectRoot.absolutePath)
-            if (modelDir.isNotBlank()) {
-                add("--model-path")
-                add(modelDir)
-            }
-            add("-q")
-            add(queryCommand)
-        }
-        return runProcess(command, projectRoot, onLine)
+        return client
     }
+
+    private var client: SemcodeMcpClient? = null
 
     private fun runProcess(command: List<String>, workDir: File, onLine: (String) -> Unit): Boolean {
         return try {
@@ -112,6 +118,11 @@ class SemcodeProcessService(private val project: Project) {
             onLine("ERROR: ${e.message}")
             false
         }
+    }
+
+    override fun dispose() {
+        client?.teardown()
+        client = null
     }
 
     companion object {

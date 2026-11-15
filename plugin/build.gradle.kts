@@ -5,7 +5,9 @@ plugins {
 }
 
 group = "dev.semcode"
-version = "0.1.0"
+// 版本策略：每次需要用户重装插件的构建都必须升版本号，让用户能在
+// Settings | Plugins 里看清装的是哪一版（用户 2026-11-14 明确要求）
+version = "0.2.0"
 
 repositories {
     // 阿里云镜像优先（本机 init.d/mirror.gradle 只作用于 settings 层，
@@ -22,7 +24,7 @@ dependencies {
         // 且编译目标即部署目标（fork 系 IDE 插件开发的正确姿势）。
         // 本机 IDEA/CLion 为 2026.3（263），对 243 目标太新，不用。
         // 备选：intellijIdeaCommunity("243.21565.14") { useInstaller = false } + jetbrainsRuntime()
-        local("D:/devtools/Huawei/DevEco Studio")
+        local("E:/devtools/DevEco Studio")
     }
 }
 

@@ -16,9 +16,6 @@ class SemcodeSettings : PersistentStateComponent<SemcodeSettings> {
     /** 存放 semcode-index.exe / semcode.exe / semcode-mcp.exe 的目录 */
     var binariesDir: String = ""
 
-    /** 向量模型目录（model2vec 蒸馏产物）。空 = semcode 默认缓存位置 */
-    var modelDir: String = ""
-
     override fun getState(): SemcodeSettings = this
 
     override fun loadState(state: SemcodeSettings) {

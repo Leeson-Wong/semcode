@@ -29,7 +29,7 @@ class IndexProjectAction : AnAction(), DumbAware {
                 val service = SemcodeProcessService.getInstance(project)
                 val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
 
-                val ok = service.runIndexChain(java.io.File(root)) { line ->
+                val ok = service.runIndexChain { line ->
                     lines.add(line)
                     // 进度文本滚动显示最近一行输出
                     indicator.text = line.take(120)
