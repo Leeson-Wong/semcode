@@ -27,6 +27,7 @@ enum SurveyLanguage {
     Zig,
     Java,
     ArkTs,
+    Kotlin,
 }
 
 impl SurveyLanguage {
@@ -40,6 +41,7 @@ impl SurveyLanguage {
             "zig" => Some(Self::Zig),
             "java" => Some(Self::Java),
             "ets" => Some(Self::ArkTs),
+            "kt" | "kts" => Some(Self::Kotlin),
             _ => None,
         }
     }
@@ -80,7 +82,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
     }
     if !is_supported_for_analysis(path.to_string_lossy().as_ref()) {
         bail!(
-            "unsupported source file '{}'; expected C, C++, Rust, Python, Zig, Java, or ArkTS",
+            "unsupported source file '{}'; expected C, C++, Rust, Python, Zig, Java, ArkTS, or Kotlin",
             path.display()
         );
     }
@@ -97,6 +99,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
         SurveyLanguage::Zig => tree_sitter_zig::LANGUAGE.into(),
         SurveyLanguage::Java => tree_sitter_java::LANGUAGE.into(),
         SurveyLanguage::ArkTs => tree_sitter_arkts::LANGUAGE.into(),
+        SurveyLanguage::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
     };
     parser.set_language(&grammar)?;
     let tree = parser
@@ -291,6 +294,25 @@ fn is_basic_type(language: SurveyLanguage, name: &str) -> bool {
                 | "bigint"
                 | "symbol"
         ),
+        SurveyLanguage::Kotlin => matches!(
+            name,
+            "Unit"
+                | "Nothing"
+                | "Boolean"
+                | "Char"
+                | "String"
+                | "Byte"
+                | "Short"
+                | "Int"
+                | "Long"
+                | "UByte"
+                | "UShort"
+                | "UInt"
+                | "ULong"
+                | "Float"
+                | "Double"
+                | "Any"
+        ),
     }
 }
 
@@ -358,6 +380,7 @@ fn walk(node: Node<'_>, source: &[u8], language: SurveyLanguage, out: &mut Surve
         SurveyLanguage::Zig => extract_zig(node, source, out),
         SurveyLanguage::Java => extract_java(node, source, out),
         SurveyLanguage::ArkTs => extract_arkts(node, source, out),
+        SurveyLanguage::Kotlin => extract_kotlin(node, source, out),
     }
 
     let mut cursor = node.walk();
@@ -611,6 +634,117 @@ fn extract_arkts(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
         }
         _ => {}
     }
+}
+
+fn extract_kotlin(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
+    // The fwcd-lineage grammar has no name fields, so names come from
+    // positional children. The survey reads one node at a time and may
+    // inspect modifiers in code, so an interface keeps its own kind here
+    // even though the analyzer's type query cannot split it.
+    match node.kind() {
+        "function_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "simple_identifier" {
+                    if let Some(name) = text(child, source) {
+                        out.functions_defined.push((name, line(node)));
+                    }
+                    break;
+                }
+            }
+        }
+        "call_expression" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                let name = match child.kind() {
+                    // `foo()` and `Foo()` name their callee directly.
+                    "simple_identifier" => text(child, source),
+                    // `a.b()` names the property on the callee's suffix.
+                    "navigation_expression" => navigation_callee(child, source),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    increment(&mut out.calls, name);
+                }
+            }
+        }
+        "class_declaration" => {
+            let mut cursor = node.walk();
+            let mut name = None;
+            let mut is_enum = false;
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "type_identifier" => name = text(child, source),
+                    "enum_class_body" => is_enum = true,
+                    _ => {}
+                }
+            }
+            let kind = if class_is_interface(node, source) {
+                "interface"
+            } else if is_enum {
+                "enum"
+            } else {
+                "class"
+            };
+            if let Some(name) = name {
+                out.types_defined
+                    .push((format!("{kind} {name}"), line(node)));
+            }
+        }
+        "object_declaration" | "companion_object" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "type_identifier" {
+                    if let Some(name) = text(child, source) {
+                        out.types_defined
+                            .push((format!("object {name}"), line(node)));
+                    }
+                    break;
+                }
+            }
+        }
+        "type_identifier" => {
+            if let Some(value) = text(node, source) {
+                increment(&mut out.types_mentioned, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The property a `a.b()` callee navigation names: the simple_identifier on
+/// its direct navigation_suffix.
+fn navigation_callee(navigation: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = navigation.walk();
+    for part in navigation.children(&mut cursor) {
+        if part.kind() == "navigation_suffix" {
+            let mut inner = part.walk();
+            for leaf in part.children(&mut inner) {
+                if leaf.kind() == "simple_identifier" {
+                    return text(leaf, source);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether a class_declaration's modifiers spell `interface`, read from the
+/// class_modifier child's text — the token itself is unnamed.
+fn class_is_interface(node: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "modifiers" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for part in child.children(&mut inner) {
+            if part.kind() == "class_modifier" {
+                return text(part, source).as_deref() == Some("interface");
+            }
+        }
+    }
+    false
 }
 
 fn extract_zig(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {

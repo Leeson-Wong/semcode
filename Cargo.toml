@@ -39,11 +39,16 @@ tree-sitter-python = "0.25"
 tree-sitter-zig = "1.1"
 tree-sitter-java = "0.23"
 tree-sitter-arkts = "0.3.0"
+# Kotlin via the upstream grammar.  crates.io only carries 0.3.8 (old
+# `fn language()` binding, ABI-incompatible with tree-sitter 0.26); main has
+# the `LANGUAGE: LanguageFn` binding but no release yet, so pin the rev.
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "d6af96d2e23ef0a8ff5ab512864378cf08fba311" }
 streaming-iterator = "0.1"
 once_cell = "1.21"
 oneshot = "0.2"
 crossbeam-channel = "0.5"
 sha1 = "0.10"
+sha2 = "0.10"             # model fingerprint for vector-table invalidation
 blake3 = "1.8.3"
 hex = "0.4"
 dashmap = "6.1"
@@ -91,3 +96,7 @@ path = "src/bin/semcode-lsp.rs"
 
 [profile.release]
 debug = false
+# Windows MSVC 上符号本来就在外置 .pdb（cargo strip 对 PE 基本无效果，
+# exe 的 200MB 是真实的单态化机器码——arrow/lance/gix 等），分发体积
+# 靠 zip 压缩（实测 ~3.4x）解决。strip 保留：对 ELF 构建的 CI 产物有效。
+strip = true

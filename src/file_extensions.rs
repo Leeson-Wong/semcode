@@ -21,10 +21,14 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "zig",  // Zig source files
     "java", // Java source files
     "ets",  // ArkTS source files (HarmonyOS)
+    "kt",   // Kotlin source files
+    "kts",  // Kotlin script files (Gradle DSL etc.)
 ];
 
-/// Default extensions for indexing (subset of SUPPORTED_EXTENSIONS)
-pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "rs", "zig"];
+/// Default extensions for indexing. Cross-language repositories are the norm
+/// (e.g. HarmonyOS mixes ArkTS with C++), so every supported language is
+/// indexed unless the user explicitly narrows with `-e`.
+pub const DEFAULT_EXTENSIONS: &[&str] = SUPPORTED_EXTENSIONS;
 
 /// Returns a Vec<String> of all supported extensions
 pub fn supported_extensions() -> Vec<String> {
@@ -88,17 +92,22 @@ mod tests {
         assert!(exts.contains(&"rs".to_string()));
         assert!(exts.contains(&"cpp".to_string()));
         assert!(exts.contains(&"zig".to_string()));
+        assert!(exts.contains(&"java".to_string()));
+        assert!(exts.contains(&"ets".to_string()));
+        assert!(exts.contains(&"kt".to_string()));
+        assert!(exts.contains(&"kts".to_string()));
     }
 
     #[test]
     fn test_default_extensions() {
-        let exts = default_extensions();
-        assert_eq!(exts, vec!["c", "h", "rs", "zig"]);
+        // Defaults cover every supported language: cross-language repositories
+        // must be fully indexed without requiring an explicit `-e`.
+        assert_eq!(default_extensions(), supported_extensions());
     }
 
     #[test]
     fn test_default_extensions_string() {
-        assert_eq!(default_extensions_string(), "c,h,rs,zig");
+        assert_eq!(default_extensions_string(), SUPPORTED_EXTENSIONS.join(","));
     }
 
     #[test]
@@ -109,6 +118,10 @@ mod tests {
         assert!(is_supported_for_analysis("test.hpp"));
         assert!(is_supported_for_analysis("test.py"));
         assert!(is_supported_for_analysis("test.zig"));
+        assert!(is_supported_for_analysis("test.java"));
+        assert!(is_supported_for_analysis("test.ets"));
+        assert!(is_supported_for_analysis("test.kt"));
+        assert!(is_supported_for_analysis("test.kts"));
         assert!(!is_supported_for_analysis("test.txt"));
     }
 

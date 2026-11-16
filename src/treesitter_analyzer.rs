@@ -47,13 +47,18 @@ pub enum Language {
     Zig,
     Java,
     ArkTs,
+    Kotlin,
 }
 
 /// Shared extraction logic: queries, tag encoding, qualifier and guard
 /// rules. A bump re-reads every language, so this rides along in each
 /// version below. A tree-sitter core bump changes what every grammar
 /// parses through, so it bumps this too.
-pub const EXTRACTOR_VERSION: u32 = 1;
+///
+/// 2: qualified static-call edges — a PascalCase receiver (`Log.i`) now
+/// keeps its qualified spelling and the bare member edge is dropped
+/// (shared call extraction + Java/Kotlin queries).
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -65,6 +70,11 @@ pub const TREE_SITTER_RUST_VERSION: &str = "0.24.2";
 pub const TREE_SITTER_ZIG_VERSION: &str = "1.1.2";
 pub const TREE_SITTER_JAVA_VERSION: &str = "0.23.5";
 pub const TREE_SITTER_ARKTS_VERSION: &str = "0.3.0";
+// A git pin, not a registry version: fwcd has not cut a release with the
+// `LANGUAGE` binding yet (crates.io carries 0.3.8, the old `fn language()`
+// form). The lockfile test reads Cargo.lock, where a git dependency still
+// spells the version from its Cargo.toml.
+pub const TREE_SITTER_KOTLIN_VERSION: &str = "0.4.0";
 
 /// The extractor version that reads a language: shared logic plus the
 /// grammar that language parses through.
@@ -77,6 +87,7 @@ pub fn extractor_version(language: Language) -> String {
         Language::Zig => format!("tree-sitter-zig-{TREE_SITTER_ZIG_VERSION}"),
         Language::Java => format!("tree-sitter-java-{TREE_SITTER_JAVA_VERSION}"),
         Language::ArkTs => format!("tree-sitter-arkts-{TREE_SITTER_ARKTS_VERSION}"),
+        Language::Kotlin => format!("tree-sitter-kotlin-{TREE_SITTER_KOTLIN_VERSION}"),
     };
     format!("{EXTRACTOR_VERSION}+{grammar}")
 }
@@ -93,6 +104,7 @@ pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
         Language::Zig,
         Language::Java,
         Language::ArkTs,
+        Language::Kotlin,
     ]
     .into_iter()
     .map(|language| (language, extractor_version(language)))
@@ -135,6 +147,7 @@ impl Language {
                 "zig" => Some(Language::Zig),
                 "java" => Some(Language::Java),
                 "ets" => Some(Language::ArkTs),
+                "kt" | "kts" => Some(Language::Kotlin),
                 _ => None,
             })
     }
@@ -491,6 +504,7 @@ pub struct TreeSitterAnalyzer {
     zig_parser: Parser,
     java_parser: Parser,
     arkts_parser: Parser,
+    kotlin_parser: Parser,
     c_queries: &'static LanguageQueries,
     cpp_queries: &'static LanguageQueries,
     rust_queries: &'static LanguageQueries,
@@ -498,6 +512,7 @@ pub struct TreeSitterAnalyzer {
     zig_queries: &'static LanguageQueries,
     java_queries: &'static LanguageQueries,
     arkts_queries: &'static LanguageQueries,
+    kotlin_queries: &'static LanguageQueries,
     /// Read `.h` files as C++ instead of the default C. Per-index state,
     /// recorded in `schema_meta` when the index is built; off everywhere
     /// else, including every test.
@@ -560,6 +575,11 @@ impl TreeSitterAnalyzer {
         let mut arkts_parser = Parser::new();
         arkts_parser.set_language(&arkts_language)?;
 
+        // Initialize Kotlin parser and queries
+        let kotlin_language = tree_sitter_kotlin::LANGUAGE.into();
+        let mut kotlin_parser = Parser::new();
+        kotlin_parser.set_language(&kotlin_language)?;
+
         // Compiled once for the process, not once per analyzer: see
         // c_queries() below.
         let c_queries = Self::c_queries()?;
@@ -569,6 +589,7 @@ impl TreeSitterAnalyzer {
         let zig_queries = Self::zig_queries()?;
         let java_queries = Self::java_queries()?;
         let arkts_queries = Self::arkts_queries()?;
+        let kotlin_queries = Self::kotlin_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
@@ -578,6 +599,7 @@ impl TreeSitterAnalyzer {
             zig_parser,
             java_parser,
             arkts_parser,
+            kotlin_parser,
             c_queries,
             cpp_queries,
             rust_queries,
@@ -585,6 +607,7 @@ impl TreeSitterAnalyzer {
             zig_queries,
             java_queries,
             arkts_queries,
+            kotlin_queries,
             headers_as_cpp: false,
         })
     }
@@ -700,6 +723,18 @@ impl TreeSitterAnalyzer {
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("ArkTS queries: {e}"))
+    }
+
+    fn kotlin_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_kotlin_queries(&tree_sitter_kotlin::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("Kotlin queries: {e}"))
     }
 
     fn create_c_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
@@ -1659,7 +1694,9 @@ impl TreeSitterAnalyzer {
         // receiver-typed site the Java pass cannot resolve would only be
         // noise. `this.x()` is the exception — the receiver names the
         // enclosing class, so it earns a tagged edge. `new Foo()` names
-        // Foo's constructor, which is indexed under the class name.
+        // Foo's constructor, which is indexed under the class name. A
+        // PascalCase receiver names a type, and the edge keeps the
+        // qualified spelling (`Log.i`), the C++ namespace treatment.
         let call_query = Query::new(
             language,
             r#"
@@ -1672,6 +1709,12 @@ impl TreeSitterAnalyzer {
                 name: (identifier) @member_name
                 (#eq? @receiver "this")
             ) @method_call
+
+            (method_invocation
+                object: (identifier) @static_receiver
+                name: (identifier) @static_member
+                (#match? @static_receiver "^[A-Z]")
+            ) @call
 
             (object_creation_expression
                 type: (type_identifier) @function_name
@@ -1819,6 +1862,141 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    fn create_kotlin_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // A fwcd-lineage grammar that spells nothing as fields: the function
+        // name is a positional `simple_identifier` child and the optional
+        // return type is whatever type node sits between the parameters and
+        // the body. Positional children must be consecutive, and a `where`
+        // clause can stand between type and body, so it rides in the pattern
+        // as an optional step. Functions without a body — interface
+        // signatures, abstract members — do not match, the Python and Java
+        // treatment. A `fun f() = expr` body carries the expression as its
+        // single child and reads the same way as a block.
+        let function_query = Query::new(
+            language,
+            r#"
+            (function_declaration
+                (simple_identifier) @function_name
+                (function_value_parameters) @parameters
+                [
+                    (user_type)
+                    (function_type)
+                    (nullable_type)
+                    (not_nullable_type)
+                    (parenthesized_type)
+                ]? @return_type
+                (type_constraints)?
+                (function_body) @body
+            ) @function
+        "#,
+        )?;
+
+        let comment_query = Query::new(
+            language,
+            r#"
+            (line_comment) @comment
+            (multiline_comment) @comment
+        "#,
+        )?;
+
+        // Kotlin spells interfaces as a modifier on class_declaration, and a
+        // query cannot say "class_modifier present but not `interface`" (a
+        // predicate only filters matches it can see, and modifier-less
+        // declarations see none), so an interface kind would need either
+        // double-matching queries or a code pass. Interfaces read as kind
+        // `class` for now, the documented tradeoff. Enums are spelled with an
+        // `enum_class_body` and stay distinct.
+        let type_query = Query::new(
+            language,
+            r#"
+            (class_declaration
+                (type_identifier) @type_name
+                (enum_class_body) @body
+            ) @enum
+
+            (class_declaration
+                (type_identifier) @type_name
+                (class_body) @body
+            ) @class
+
+            (object_declaration
+                (type_identifier) @type_name
+                (class_body) @body
+            ) @class
+
+            (companion_object
+                (type_identifier) @type_name
+                (class_body) @body
+            ) @class
+        "#,
+        )?;
+
+        // Annotations occupy the macro slot and are read but never stored,
+        // the Python, Java and ArkTS treatment: nothing about @Inject is
+        // function-like. `@Foo` carries a bare user_type, `@Foo(...)` a
+        // constructor_invocation around one.
+        let macro_query = Query::new(
+            language,
+            r#"
+            (annotation
+                (user_type (type_identifier) @macro_name)
+            ) @annotation
+
+            (annotation
+                (constructor_invocation
+                    (user_type (type_identifier) @macro_name))
+            ) @annotation
+        "#,
+        )?;
+
+        // Every invocation contributes a name-level edge, qualified or not:
+        // that is the level the call graph resolves at, and a receiver the
+        // pass cannot type would only be noise. Bare calls name their callee
+        // directly (`foo()`, and `Foo()` constructors beside them); member
+        // calls contribute the property name from the callee's
+        // navigation_suffix. `this.x()` additionally earns its tagged edge —
+        // the receiver names the enclosing class. A PascalCase receiver
+        // names a type and keeps the qualified spelling (`Log.i`), the C++
+        // namespace treatment. Constructors invoked in annotations
+        // (`@Foo(...)`) parse as constructor_invocation, not
+        // call_expression, and stay out.
+        let call_query = Query::new(
+            language,
+            r#"
+            (call_expression
+                (simple_identifier) @function_name
+            ) @call
+
+            (call_expression
+                (navigation_expression
+                    (navigation_suffix (simple_identifier) @function_name))
+            ) @call
+
+            (call_expression
+                (navigation_expression
+                    (this_expression) @receiver
+                    (navigation_suffix (simple_identifier) @member_name))
+            ) @method_call
+
+            (call_expression
+                (navigation_expression
+                    (simple_identifier) @static_receiver
+                    (navigation_suffix (simple_identifier) @static_member))
+                (#match? @static_receiver "^[A-Z]")
+            ) @call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None, // type_alias exists but rides in no query yet
+            macro_query,
+            call_query,
+        })
+    }
+
     fn create_zig_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
         // Named functions and tests. Anonymous `fn` types have no name field
         // and are left to the type query. `!body` is the extern/declaration
@@ -1958,6 +2136,7 @@ impl TreeSitterAnalyzer {
             Language::Zig => &mut self.zig_parser,
             Language::Java => &mut self.java_parser,
             Language::ArkTs => &mut self.arkts_parser,
+            Language::Kotlin => &mut self.kotlin_parser,
         }
     }
 
@@ -1971,6 +2150,7 @@ impl TreeSitterAnalyzer {
             Language::Zig => self.zig_queries,
             Language::Java => self.java_queries,
             Language::ArkTs => self.arkts_queries,
+            Language::Kotlin => self.kotlin_queries,
         }
     }
 
@@ -2830,6 +3010,9 @@ impl TreeSitterAnalyzer {
             source_code.as_bytes(),
         );
 
+        // Member positions whose bare edge a qualified static edge replaced.
+        let mut static_member_starts: Vec<usize> = Vec::new();
+
         while let Some(call_match) = matches.next() {
             let mut member: Option<tree_sitter::Node> = None;
             let mut receiver: Option<tree_sitter::Node> = None;
@@ -2839,6 +3022,8 @@ impl TreeSitterAnalyzer {
             let mut static_call_name: Option<tree_sitter::Node> = None;
             let mut static_call_key: Option<tree_sitter::Node> = None;
             let mut static_call_site: Option<tree_sitter::Node> = None;
+            let mut static_receiver: Option<tree_sitter::Node> = None;
+            let mut static_member: Option<tree_sitter::Node> = None;
 
             for capture in call_match.captures {
                 match queries.call_query.capture_names()[capture.index as usize] {
@@ -2849,6 +3034,8 @@ impl TreeSitterAnalyzer {
                         }
                     }
                     "member_name" => member = Some(capture.node),
+                    "static_receiver" => static_receiver = Some(capture.node),
+                    "static_member" => static_member = Some(capture.node),
                     "receiver" => receiver = Some(capture.node),
                     "macro_name" => macro_name = Some(capture.node),
                     "macro_args" => macro_args = Some(capture.node),
@@ -2875,6 +3062,26 @@ impl TreeSitterAnalyzer {
                         }
                     }
                     _ => {}
+                }
+            }
+
+            // A receiver spelled in PascalCase names a type — `Log.i(...)`,
+            // `TextUtils.equals(...)` — and the type is part of the callee's
+            // identity the way a namespace is in C++. The edge keeps the
+            // qualified spelling, and the plain member edge the other pattern
+            // recorded for the same site is dropped below. A camelCase
+            // receiver is a variable; the instance method keeps its bare
+            // name-level edge (user feedback 2026-11-16: bare `i` was noise).
+            if let (Some(recv), Some(memb)) = (static_receiver, static_member) {
+                let recv_text = &source_code[recv.byte_range()];
+                let member_text = &source_code[memb.byte_range()];
+                if !recv_text.is_empty() && !member_text.is_empty() {
+                    extraction.calls.push((
+                        format!("{recv_text}.{member_text}"),
+                        recv.start_byte(),
+                        recv.end_byte(),
+                    ));
+                    static_member_starts.push(memb.start_byte());
                 }
             }
 
@@ -2991,6 +3198,18 @@ impl TreeSitterAnalyzer {
                     target: None,
                 });
             }
+        }
+
+        // Drop the bare member edges that qualified static edges replaced:
+        // both patterns capture the same member node, so position identifies
+        // the duplicate. The qualified edge itself sits at the receiver's
+        // bytes and survives.
+        if !static_member_starts.is_empty() {
+            let replaced: std::collections::HashSet<usize> =
+                static_member_starts.into_iter().collect();
+            extraction
+                .calls
+                .retain(|(_, start, _)| !replaced.contains(start));
         }
 
         let bound = Self::value_names(tree.root_node(), source_code);
@@ -3752,7 +3971,9 @@ impl TreeSitterAnalyzer {
         let owner = qualifier?;
         let receiver = site.receiver_expr.as_deref()?;
         let is_self = match language {
-            Language::Cpp | Language::Java | Language::ArkTs => receiver == "this",
+            Language::Cpp | Language::Java | Language::ArkTs | Language::Kotlin => {
+                receiver == "this"
+            }
             // `this`/`self` names the enclosing type (C++ class, Python
             // class, Rust impl), so the call resolves against a known owner
             // instead of falling through to the dispatch table, where a
@@ -5018,9 +5239,9 @@ impl TreeSitterAnalyzer {
                     Language::C | Language::Cpp => Self::guard_of(node, ctx.source),
                     Language::Python => Self::python_guard(node, ctx.source),
                     Language::Zig => Self::zig_guard(node, ctx.source),
-                    // Java and ArkTS have no conditional compilation; a
-                    // method is always compiled.
-                    Language::Java | Language::ArkTs => None,
+                    // Java, ArkTS and Kotlin have no conditional
+                    // compilation; a method is always compiled.
+                    Language::Java | Language::ArkTs | Language::Kotlin => None,
                 }),
                 qualifier,
             };
@@ -5807,6 +6028,10 @@ impl TreeSitterAnalyzer {
             return Self::parse_java_parameters(node, source);
         }
 
+        if node.kind() == "function_value_parameters" {
+            return Self::parse_kotlin_parameters(node, source);
+        }
+
         let mut parameters = Vec::new();
 
         // Walk through the parameter_list node to find parameter children.
@@ -6111,6 +6336,7 @@ impl TreeSitterAnalyzer {
                             node,
                             ctx.source,
                             &function_name,
+                            ctx.language,
                         ));
                     }
                 }
@@ -7094,6 +7320,7 @@ impl TreeSitterAnalyzer {
             Language::Zig => Self::zig_owner_qualifier(node, source, file_path),
             Language::Java => Self::java_owner_qualifier(node, source),
             Language::ArkTs => Self::arkts_owner_qualifier(node, source),
+            Language::Kotlin => Self::kotlin_owner_qualifier(node, source),
             Language::C => None,
         }
     }
@@ -7170,6 +7397,60 @@ impl TreeSitterAnalyzer {
                         scopes.push(text.to_string());
                     }
                 }
+            }
+            parent = current.parent();
+        }
+        scopes.reverse();
+        segments.extend(scopes);
+        if segments.is_empty() {
+            return None;
+        }
+        Some(segments.join("."))
+    }
+
+    /// The entity owning a Kotlin definition: the declared package plus every
+    /// enclosing class or object, outermost first — the Java reading over the
+    /// fwcd-lineage shapes. The grammar has no name fields, so the type names
+    /// come from positional `type_identifier` children. An unnamed
+    /// `companion object` carries the language's implicit name `Companion`;
+    /// a top-level function keeps the package alone as its qualifier.
+    fn kotlin_owner_qualifier(defined_at: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut segments: Vec<String> = Vec::new();
+
+        let mut root = defined_at;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            if child.kind() != "package_header" {
+                continue;
+            }
+            if let Some(name) = child.named_child(0) {
+                if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                    segments.extend(text.split('.').map(str::to_string));
+                }
+            }
+            break;
+        }
+
+        let mut scopes = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            if matches!(
+                current.kind(),
+                "class_declaration" | "object_declaration" | "companion_object"
+            ) {
+                let mut inner = current.walk();
+                let name = current
+                    .children(&mut inner)
+                    .find_map(|child| match child.kind() {
+                        "type_identifier" | "simple_identifier" => {
+                            child.utf8_text(source.as_bytes()).ok().map(str::to_string)
+                        }
+                        _ => None,
+                    });
+                scopes.push(name.unwrap_or_else(|| "Companion".to_string()));
             }
             parent = current.parent();
         }
@@ -7426,6 +7707,59 @@ impl TreeSitterAnalyzer {
                 type_file_path: None,
                 type_git_file_hash: None,
             });
+        }
+        parameters
+    }
+
+    /// Kotlin parameters: a `parameter` child whose positional pieces are the
+    /// `simple_identifier` name and one type node. `vararg` rides in a
+    /// `parameter_modifiers` sibling that precedes the parameter it modifies
+    /// — the grammar's parameter node has no modifiers child of its own —
+    /// and the suffix spells the arity the way the Java reader spells
+    /// `String...`. Default values are expressions and no part of the type.
+    fn parse_kotlin_parameters(node: tree_sitter::Node, source: &str) -> Vec<ParameterInfo> {
+        let mut parameters = Vec::new();
+        let mut vararg_pending = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "parameter_modifiers" => {
+                    vararg_pending = source[child.byte_range()].contains("vararg");
+                }
+                "parameter" => {
+                    let mut name = String::new();
+                    let mut type_name = String::new();
+                    let mut inner = child.walk();
+                    for part in child.children(&mut inner) {
+                        match part.kind() {
+                            "simple_identifier" if name.is_empty() => {
+                                name = source[part.byte_range()].to_string();
+                            }
+                            "user_type" | "function_type" | "nullable_type"
+                            | "not_nullable_type" | "parenthesized_type"
+                                if type_name.is_empty() =>
+                            {
+                                type_name = collapse_whitespace(&source[part.byte_range()]);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if vararg_pending {
+                        type_name.push_str("...");
+                    }
+                    vararg_pending = false;
+                    if name.is_empty() && type_name.is_empty() {
+                        continue;
+                    }
+                    parameters.push(ParameterInfo {
+                        name,
+                        type_name,
+                        type_file_path: None,
+                        type_git_file_hash: None,
+                    });
+                }
+                _ => {}
+            }
         }
         parameters
     }
@@ -7826,8 +8160,17 @@ impl TreeSitterAnalyzer {
         function_node: tree_sitter::Node,
         source: &str,
         function_name: &Option<String>,
+        language: Language,
     ) -> String {
         let function_text = &source[function_node.byte_range()];
+
+        // Kotlin spells its return type after the parameters, never before
+        // the name: what the query did not capture means Unit, and the text
+        // before the name is modifiers, a receiver, or the `fun` keyword —
+        // never a type.
+        if language == Language::Kotlin {
+            return "Unit".to_string();
+        }
 
         // Find the function name position to know where the return type ends
         if let Some(name) = function_name {
@@ -10800,6 +11143,14 @@ test "helper ok" {
             Language::from_path(Path::new("entry/src/main/ets/pages/Index.ets")),
             Some(Language::ArkTs)
         );
+        assert_eq!(
+            Language::from_path(Path::new("app/src/main/java/com/example/MainActivity.kt")),
+            Some(Language::Kotlin)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("build.gradle.kts")),
+            Some(Language::Kotlin)
+        );
     }
 
     #[test]
@@ -10987,6 +11338,7 @@ mod rust_receiver_tests {
             ("tree-sitter-zig", TREE_SITTER_ZIG_VERSION),
             ("tree-sitter-java", TREE_SITTER_JAVA_VERSION),
             ("tree-sitter-arkts", TREE_SITTER_ARKTS_VERSION),
+            ("tree-sitter-kotlin", TREE_SITTER_KOTLIN_VERSION),
         ] {
             assert_eq!(
                 versions.get(krate).map(String::as_str),
@@ -11664,6 +12016,230 @@ mod rust_receiver_tests {
             ],
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn kotlin_definitions_carry_package_and_owner() {
+        // Kotlin owners read the declared package from the AST and nest
+        // through every enclosing type — classes, nested classes, enums,
+        // named objects, named companions. A named companion carries its
+        // declared name; a top-level function keeps the package alone.
+        // Interfaces read as kind `class`: the grammar spells them as a
+        // modifier on class_declaration, and no query can split that
+        // without double-matching (see create_kotlin_queries).
+        let source = "package com.example.app\n\
+             \n\
+             class Outer {\n\
+             \tfun size(): Int = 1\n\
+             \n\
+             \tclass Inner {\n\
+             \t\tfun run() {}\n\
+             \t}\n\
+             \n\
+             \tinterface Hook {\n\
+             \t\tfun onStart() {}\n\
+             \t}\n\
+             \n\
+             \tenum class Color {\n\
+             \t\tRED, GREEN;\n\
+             \n\
+             \t\tfun describe() {}\n\
+             \t}\n\
+             \n\
+             \tobject Holder {\n\
+             \t\tval tag = \"x\"\n\
+             \t}\n\
+             \n\
+             \tcompanion object Named {\n\
+             \t\tfun create(): Outer = Outer()\n\
+             \t}\n\
+             }\n\
+             \n\
+             fun toplevel() {}\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                source,
+                std::path::Path::new("app/src/main/java/com/example/app/Outer.kt"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let mut found: Vec<(String, Option<String>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.qualifier.clone()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "create".to_string(),
+                    Some("com.example.app.Outer.Named".to_string())
+                ),
+                (
+                    "describe".to_string(),
+                    Some("com.example.app.Outer.Color".to_string())
+                ),
+                (
+                    "onStart".to_string(),
+                    Some("com.example.app.Outer.Hook".to_string())
+                ),
+                (
+                    "run".to_string(),
+                    Some("com.example.app.Outer.Inner".to_string())
+                ),
+                (
+                    "size".to_string(),
+                    Some("com.example.app.Outer".to_string())
+                ),
+                ("toplevel".to_string(), Some("com.example.app".to_string())),
+            ],
+            "{found:?}"
+        );
+        let mut type_names: Vec<(String, String)> = analysis
+            .types
+            .iter()
+            .map(|t| (t.name.clone(), t.kind.clone()))
+            .collect();
+        type_names.sort();
+        assert_eq!(
+            type_names,
+            vec![
+                ("Color".to_string(), "enum".to_string()),
+                ("Holder".to_string(), "class".to_string()),
+                ("Hook".to_string(), "class".to_string()),
+                ("Inner".to_string(), "class".to_string()),
+                ("Named".to_string(), "class".to_string()),
+                ("Outer".to_string(), "class".to_string()),
+            ],
+            "{type_names:?}"
+        );
+    }
+
+    #[test]
+    fn kotlin_functions_carry_params_calls_and_skip_bodyless_forms() {
+        // Every invocation names a callee at name level, `this.x()` adds its
+        // owner, `Foo()` constructors read as edges to the class name,
+        // annotations occupy the macro slot but store nothing, and
+        // body-less functions (interface signatures, abstract members) are
+        // not indexed. An unannotated return reads Unit: Kotlin spells no
+        // return type before the name, so there is nothing else it could be.
+        let source = "package com.example.app\n\
+             \n\
+             class Service {\n\
+             \t@Deprecated(\"old\")\n\
+             \tfun render(items: List<String>, vararg rest: String): String {\n\
+             \t\tval other = Service()\n\
+             \t\tother.refresh()\n\
+             \t\trefresh()\n\
+             \t\tLog.i(\"tag\", \"done\")\n\
+             \t\tlog(\"done\")\n\
+             \t\treturn this.format(items)\n\
+             \t}\n\
+             \n\
+             \tfun refresh() {}\n\
+             \n\
+             \tfun format(items: List<String>): String = \"\"\n\
+             \n\
+             \tfun log(msg: String) {}\n\
+             \n\
+             \tfun expression(x: Int) = x * 2\n\
+             \n\
+             \tabstract fun fly()\n\
+             }\n\
+             \n\
+             interface Callback {\n\
+             \tfun onEvent(e: String)\n\
+             \n\
+             \tfun done() {}\n\
+             }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                source,
+                std::path::Path::new("app/src/main/java/com/example/app/Service.kt"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            analysis.macros.is_empty(),
+            "annotations must not be stored: {:?}",
+            analysis.macros
+        );
+        assert!(
+            !analysis.functions.iter().any(|f| f.name == "fly"),
+            "abstract functions have no body to index: {:?}",
+            analysis.functions
+        );
+        assert!(
+            !analysis.functions.iter().any(|f| f.name == "onEvent"),
+            "interface signatures have no body to index: {:?}",
+            analysis.functions
+        );
+        assert!(
+            analysis.functions.iter().any(|f| f.name == "done"),
+            "interface functions with a body index: {:?}",
+            analysis.functions
+        );
+        assert!(
+            analysis.functions.iter().any(|f| f.name == "expression"),
+            "expression bodies are bodies: {:?}",
+            analysis.functions
+        );
+
+        let render = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "render")
+            .unwrap();
+        assert_eq!(render.return_type, "String");
+        let mut params: Vec<(String, String)> = render
+            .parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.type_name.clone()))
+            .collect();
+        params.sort();
+        assert_eq!(
+            params,
+            vec![
+                ("items".to_string(), "List<String>".to_string()),
+                ("rest".to_string(), "String...".to_string()),
+            ],
+            "{params:?}"
+        );
+
+        let mut calls = render.calls.clone().unwrap_or_default();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(
+            calls,
+            vec![
+                plain("Log.i"),
+                plain("Service"),
+                plain("format"),
+                plain("log"),
+                plain("refresh"),
+                tagged("format", "com.example.app.Service"),
+            ],
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| format!("{c:?}").contains("\"i\"")),
+            "a PascalCase receiver keeps its qualified edge, not bare `i`: {calls:?}"
+        );
+
+        let expression = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "expression")
+            .unwrap();
+        assert_eq!(expression.return_type, "Unit");
+        assert_eq!(expression.parameters.len(), 1);
+        assert_eq!(expression.parameters[0].type_name, "Int");
     }
 
     #[test]
