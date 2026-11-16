@@ -22,6 +22,11 @@ fn get_batch_size() -> usize {
 #[derive(Clone)]
 pub struct CodeVectorizer {
     model: Arc<StaticModel>,
+    /// Identity of the loaded weights (sha256 of model.safetensors, hex
+    /// prefix). Vectors from different models live in different spaces:
+    /// comparing them ranks neighbours at random, so the vector tables
+    /// record this and rebuild when it moves.
+    fingerprint: Arc<String>,
 }
 
 impl CodeVectorizer {
@@ -33,21 +38,68 @@ impl CodeVectorizer {
         // model2vec-rs doesn't use GPU acceleration, so we ignore the gpu flag
 
         // Download and setup model
-        let model = Self::load_model(model_path).await?;
+        let (model, loaded_from) = Self::load_model(model_path).await?;
+        // The fingerprint covers the whole embedding pipeline identity, not
+        // just the weights: a preprocessing change moves every vector as
+        // surely as a model swap does. pp2 = comments kept in the input.
+        let fingerprint = format!(
+            "{}:pp2",
+            Self::file_fingerprint(&loaded_from.join("model.safetensors"))
+        );
 
         tracing::info!("Initialized CodeVectorizer using model2vec-rs");
 
         Ok(Self {
             model: Arc::new(model),
+            fingerprint: Arc::new(fingerprint),
         })
     }
 
-    async fn load_model(model_path: Option<String>) -> Result<StaticModel> {
+    /// The loaded model's identity, for vector-table invalidation.
+    pub fn model_fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// sha256 of a file's bytes, first 16 hex chars. Any hash serves; this
+    /// one is cheap to reproduce outside Rust (the plugin hashes the bundled
+    /// model the same way to decide a vectors refresh).
+    fn file_fingerprint(path: &std::path::Path) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        match std::fs::File::open(path) {
+            Ok(mut file) => {
+                use std::io::Read;
+                // Heap buffer: a 1MB stack array overflows the thread stack.
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    match file.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => hasher.update(&buf[..n]),
+                        Err(e) => {
+                            tracing::warn!("fingerprint read failed, using length: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("fingerprint open failed, using constant: {}", e);
+                return "unknown".to_string();
+            }
+        }
+        let digest = hasher.finalize();
+        digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The loaded model and the directory it came from (for fingerprinting).
+    async fn load_model(model_path: Option<String>) -> Result<(StaticModel, std::path::PathBuf)> {
         // If a specific model path is provided, use it directly
         if let Some(path) = model_path {
             tracing::info!("Loading model2vec from specified path: {}", path);
-            return StaticModel::from_pretrained(&path, None, Some(true), None)
-                .map_err(|e| anyhow::anyhow!("Failed to load model from '{}': {}", path, e));
+            let dir = std::path::PathBuf::from(&path);
+            let model = StaticModel::from_pretrained(&path, None, Some(true), None)
+                .map_err(|e| anyhow::anyhow!("Failed to load model from '{}': {}", path, e))?;
+            return Ok((model, dir));
         }
 
         let model_dir = dirs::cache_dir()
@@ -62,14 +114,15 @@ impl CodeVectorizer {
 
         if local_model_path.exists() {
             tracing::info!("Loading model2vec from local cache: {:?}", local_model_path);
-            return StaticModel::from_pretrained(&local_model_path, None, Some(true), None)
+            let model = StaticModel::from_pretrained(&local_model_path, None, Some(true), None)
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to load cached model from '{:?}': {}",
                         local_model_path,
                         e
                     )
-                });
+                })?;
+            return Ok((model, local_model_path));
         }
 
         // No model found
@@ -194,9 +247,11 @@ mod tests {
         let processed = preprocess_code(input);
         assert!(!processed.contains("__attribute__"));
         assert!(!processed.contains("EXPORT_SYMBOL"));
-        assert!(!processed.contains("//"));
-        assert!(!processed.contains("/*"));
         assert!(!processed.contains("asm volatile"));
+        // Comments stay: they are the natural-language half of a function
+        // body, and the embedding model reads them.
+        assert!(processed.contains("This is a comment"));
+        assert!(processed.contains("Multi-line"));
     }
 
     #[test]

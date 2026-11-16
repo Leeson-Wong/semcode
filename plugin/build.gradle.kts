@@ -7,7 +7,7 @@ plugins {
 group = "dev.semcode"
 // 版本策略：每次需要用户重装插件的构建都必须升版本号，让用户能在
 // Settings | Plugins 里看清装的是哪一版（用户 2026-11-14 明确要求）
-version = "0.4.0"
+version = "0.7.0"
 
 repositories {
     // 阿里云镜像优先（本机 init.d/mirror.gradle 只作用于 settings 层，
@@ -24,7 +24,7 @@ dependencies {
         // 且编译目标即部署目标（fork 系 IDE 插件开发的正确姿势）。
         // 本机 IDEA/CLion 为 2026.3（263），对 243 目标太新，不用。
         // 备选：intellijIdeaCommunity("243.21565.14") { useInstaller = false } + jetbrainsRuntime()
-        local("E:/devtools/DevEco Studio")
+        local("D:/devtools/Huawei/DevEco Studio")
     }
 }
 
@@ -39,6 +39,31 @@ kotlin {
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
+// 模型 + win-x64 二进制随插件分发（用户 2026-11-16 拍板零配置）：外部用户
+// 装 zip 即用，不再要求先 cargo build。二进制取 target/release（须先
+// cargo build --release；strip=true 已在 Cargo.toml 开启），模型 3 文件 ~31MB。
+// IJ Platform Gradle Plugin 2.x 的 prepareSandbox 不是 Copy 子类，挂不上去，
+// 直接改 buildPlugin 的 Zip；runIde 沙箱不带两者，开发机用 Settings 覆盖 +
+// semcode 缓存目录回退。
+val releaseDir = layout.projectDirectory.dir("../target/release")
+tasks.named<Zip>("buildPlugin") {
+    // into 相对 zip 根 spec（其自身已带 semcode-intellij/ 前缀），故只写 model/bin
+    from(layout.projectDirectory.dir("model/model2vec")) {
+        into("model")
+    }
+    from(releaseDir) {
+        include("semcode-index.exe", "semcode-mcp.exe")
+        into("bin")
+    }
+    doFirst {
+        val missing = listOf("semcode-index.exe", "semcode-mcp.exe")
+            .filterNot { releaseDir.file(it).asFile.isFile }
+        require(missing.isEmpty()) {
+            "bundled binaries missing in ${releaseDir}: $missing — run `cargo build --release` first"
+        }
     }
 }
 

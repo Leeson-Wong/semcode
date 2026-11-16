@@ -12,11 +12,12 @@ class SemcodeSettingsConfigurable : Configurable {
     override fun getDisplayName(): String = "Semcode"
 
     override fun createComponent(): JComponent = panel {
-        row("Semcode binaries directory:") { cell(binariesDirField) }
+        row("Binaries directory (optional override):") { cell(binariesDirField) }
         row {
             comment(
-                "Binaries dir must contain semcode-index(.exe), semcode(.exe), semcode-mcp(.exe). " +
-                    "Only needed for development builds; released bundles ship these binaries."
+                "Leave empty to use the binaries bundled with the plugin. " +
+                    "Set this only to run against a local build (e.g. target/release); " +
+                    "the directory must contain semcode-index(.exe) and semcode-mcp(.exe)."
             )
         }
     }

@@ -49,6 +49,13 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
     private class SemcodeConsolePanel(private val project: Project) : JPanel(BorderLayout()) {
 
         private val statusLabel = JLabel("Checking semcode status…")
+        private val consoleArea = com.intellij.ui.components.JBTextArea(6, 60).apply {
+            isEditable = false
+            lineWrap = true
+            wrapStyleWord = true
+            emptyText.setText("Indexing output appears here")
+        }
+        private val consoleTimer = javax.swing.Timer(500) { refreshConsole() }.apply { stop() }
         private val searchField = JBTextField().apply { emptyText.text = "Describe what you're looking for…" }
         private val searchButton = JButton("Search")
         private val modeBox = JComboBox(arrayOf("Semantic", "Regex"))
@@ -90,6 +97,24 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             rebuildButton.addActionListener { rebuildIndex() }
             refreshButton.addActionListener { refreshStatus() }
 
+            // 索引可视化（用户 2026-11-16 要求面板内可见）：启动自动索引与
+            // 手动 Rebuild 共用 service 的日志流；跑动中 500ms 刷新一次尾部。
+            service().addIndexListener { running ->
+                SwingUtilities.invokeLater {
+                    if (running) {
+                        statusLabel.text = "Indexing…"
+                        consoleTimer.start()
+                    } else {
+                        consoleTimer.stop()
+                        refreshConsole()
+                        refreshStatus()
+                    }
+                }
+            }
+            if (service().indexRunning) {
+                consoleTimer.start()
+            }
+
             val searchPanel = JPanel(BorderLayout())
             val top = JPanel(BorderLayout())
             top.add(modeBox, BorderLayout.WEST)
@@ -108,7 +133,13 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
                 }
             }
 
-            add(statusPanel, BorderLayout.NORTH)
+            add(JPanel(BorderLayout()).apply {
+                add(statusPanel, BorderLayout.NORTH)
+                add(JBScrollPane(consoleArea).apply {
+                    preferredSize = java.awt.Dimension(0, 120)
+                    maximumSize = java.awt.Dimension(Int.MAX_VALUE, 160)
+                }, BorderLayout.CENTER)
+            }, BorderLayout.NORTH)
             val resultsPanel = JBScrollPane(resultList)
             add(JPanel(BorderLayout()).apply {
                 add(searchPanel, BorderLayout.NORTH)
@@ -122,6 +153,14 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         private fun service(): SemcodeProcessService = SemcodeProcessService.getInstance(project)
+
+        private fun refreshConsole() {
+            val tail = service().indexLog.toList().takeLast(80).joinToString("\n")
+            if (consoleArea.text != tail) {
+                consoleArea.text = tail
+                consoleArea.caretPosition = consoleArea.text.length
+            }
+        }
 
         private fun refreshStatus() {
             statusLabel.text = "Checking semcode status…"

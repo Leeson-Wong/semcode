@@ -761,6 +761,29 @@ impl SchemaManager {
         Ok(None)
     }
 
+    /// Write one `schema_meta` key, replacing any previous value.
+    pub async fn set_meta_value(&self, key: &str, value: &str) -> Result<()> {
+        let table = self.connection.open_table("schema_meta").execute().await?;
+        let escaped = key.replace('\'', "''");
+        table
+            .delete(&format!("key = '{escaped}'"))
+            .await
+            .with_context(|| format!("clearing {key}"))?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![key])) as arrow::array::ArrayRef,
+                Arc::new(arrow::array::StringArray::from(vec![value])) as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
     pub async fn create_schema_meta_table_for(&self, preexisting: bool) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),

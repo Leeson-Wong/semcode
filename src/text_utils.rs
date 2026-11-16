@@ -16,18 +16,16 @@ static INLINE_ASM_REGEX: LazyLock<Regex> =
 
 static WHITESPACE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
-static SINGLE_COMMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"//[^\n]*").unwrap());
-
-static MULTI_COMMENT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
-
 /// Preprocess code for better vectorization/embedding quality
 ///
 /// This function normalizes C/C++ code by:
 /// - Removing kernel-specific macros and attributes
 /// - Removing inline assembly
 /// - Normalizing whitespace while preserving line structure
-/// - Removing comments
+/// - Keeping comments: they are the main carrier of natural-language
+///   semantics (a Chinese query matches a Chinese doc comment, an English
+///   one matches an English one) — stripping them left queries matching
+///   bare identifiers, which measured at near-zero hit rates
 /// - Truncating very long functions at safe UTF-8 boundaries
 pub fn preprocess_code(code: &str) -> String {
     // Remove kernel-specific macros and attributes (using pre-compiled regexes)
@@ -52,12 +50,6 @@ pub fn preprocess_code(code: &str) -> String {
             " " // Replace other whitespace with single space
         }
     });
-
-    // Remove single-line comments but preserve structure
-    let code = SINGLE_COMMENT_REGEX.replace_all(&code, "");
-
-    // Remove multi-line comments
-    let code = MULTI_COMMENT_REGEX.replace_all(&code, "");
 
     // Truncate very long functions at a safe UTF-8 character boundary
     let code = if code.len() > 8192 {
@@ -98,9 +90,11 @@ mod tests {
         let processed = preprocess_code(input);
         assert!(!processed.contains("__attribute__"));
         assert!(!processed.contains("EXPORT_SYMBOL"));
-        assert!(!processed.contains("//"));
-        assert!(!processed.contains("/*"));
         assert!(!processed.contains("asm volatile"));
+        // Comments stay: they are the natural-language half of a function
+        // body, and the embedding model reads them.
+        assert!(processed.contains("This is a comment"));
+        assert!(processed.contains("Multi-line"));
     }
 
     #[test]

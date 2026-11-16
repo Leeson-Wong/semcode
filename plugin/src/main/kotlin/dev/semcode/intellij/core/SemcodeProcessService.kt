@@ -18,31 +18,102 @@ class SemcodeProcessService(private val project: Project) : Disposable {
 
     private val log = Logger.getInstance(SemcodeProcessService::class.java)
 
-    data class Binaries(val index: File, val query: File, val mcp: File)
+    /** 插件只需要索引器与 MCP server；交互式 semcode.exe 是纯 CLI，不捆不查。 */
+    data class Binaries(val index: File, val mcp: File)
 
+    /**
+     * 二进制解析链：Settings 里的目录（开发期覆盖，指向 target/release）
+     * → 插件捆绑的 <plugin>/bin/（0.6.0 起随 zip 分发，外部用户零配置）。
+     */
     fun resolveBinaries(): Binaries? {
         val settings = SemcodeSettings.getInstance()
-        val dir = File(settings.binariesDir)
-        if (!hasAll(dir)) {
-            return null
+        if (settings.binariesDir.isNotBlank()) {
+            val dir = File(settings.binariesDir)
+            if (hasAll(dir)) {
+                return Binaries(
+                    semcodeExe(dir, "semcode-index"),
+                    semcodeExe(dir, "semcode-mcp"),
+                )
+            }
         }
-        return Binaries(semcodeExe(dir, "semcode-index"), semcodeExe(dir, "semcode"), semcodeExe(dir, "semcode-mcp"))
+        val bundled = bundledBinariesDir() ?: return null
+        return Binaries(
+            semcodeExe(bundled, "semcode-index"),
+            semcodeExe(bundled, "semcode-mcp"),
+        )
     }
 
     private fun hasAll(dir: File): Boolean =
         semcodeExe(dir, "semcode-index").isFile &&
-            semcodeExe(dir, "semcode").isFile &&
             semcodeExe(dir, "semcode-mcp").isFile
+
+    /** zip 内 semcode-intellij/bin/（三个 exe 随插件分发）。 */
+    private fun bundledBinariesDir(): File? {
+        val jar = runCatching {
+            File(javaClass.protectionDomain.codeSource.location.toURI())
+        }.getOrNull() ?: return null
+        val dir = File(jar.parentFile, "bin")
+        return dir.takeIf { hasAll(it) }
+    }
+
+    /**
+     * 随插件 zip 分发的 model2vec 目录（zip 内 semcode-intellij/model/）。
+     * 从本类 jar 的位置反推插件根（DevEco 平台未暴露 PluginManagerCore，
+     * 且 protectionDomain 不依赖任何平台 API）；存在即用——向量步骤和
+     * MCP 都拿它当 --model-path，用户零配置；缺失（开发期沙箱未带模型）
+     * 返回 null，semcode 回退自己的缓存目录。
+     */
+    fun bundledModelDir(): File? {
+        val jar = runCatching {
+            File(javaClass.protectionDomain.codeSource.location.toURI())
+        }.getOrNull() ?: return null
+        val dir = File(jar.parentFile, "model")
+        return dir.takeIf { File(dir, "model.safetensors").isFile }
+    }
 
     fun projectRoot(): File? = project.basePath?.let { File(it) }
 
     /** 索引库目录：<project>/.idea/semcode.db（含旧位置迁移）。 */
     fun databaseDir(): File = SemcodeProjectStore.databaseDir(project)
 
+    /** 索引运行态与最近输出（面板可视化 + 启动自动索引共用一份）。 */
+    @Volatile
+    var indexRunning: Boolean = false
+        private set
+
+    val indexLog = java.util.Collections.synchronizedList(mutableListOf<String>())
+    private val indexListeners = java.util.concurrent.CopyOnWriteArrayList<(Boolean) -> Unit>()
+
+    /** 订阅索引开始/结束（true=开始）。ToolWindow 据此切换进度展示。 */
+    fun addIndexListener(listener: (Boolean) -> Unit) {
+        indexListeners.add(listener)
+    }
+
     /**
-     * 链式跑两步索引。每步输出行回调 [onLine]（进度展示），全部成功返回 true。
+     * 链式跑两步索引。每步输出行回调 [onLine]（进度展示）并进入共享日志，
+     * 全部成功返回 true。重入保护：已在跑则拒绝并返回 false。
      */
     fun runIndexChain(onLine: (String) -> Unit): Boolean {
+        if (indexRunning) {
+            onLine("ERROR: indexing already in progress")
+            return false
+        }
+        indexRunning = true
+        indexLog.clear()
+        indexListeners.forEach { it(true) }
+        try {
+            val ok = runIndexChainInner(onLine)
+            if (ok) {
+                SemcodeAgentConfig.ensure(project, this)
+            }
+            return ok
+        } finally {
+            indexRunning = false
+            indexListeners.forEach { it(false) }
+        }
+    }
+
+    private fun runIndexChainInner(onLine: (String) -> Unit): Boolean {
         val root = projectRoot() ?: run {
             onLine("ERROR: project has no base path")
             return false
@@ -52,26 +123,96 @@ class SemcodeProcessService(private val project: Project) : Disposable {
             return false
         }
         val db = databaseDir()
-        // semcode 默认扩展只有 c,h,rs,zig；C/C++ 全家（cpp/hpp/cc…）、py、java、ets 需显式开。
-        // TODO(v1.4): 改为从 semcode 查询支持列表（数据驱动，加语言时零改动）
-        val extensions = "c,h,cc,cpp,cxx,c++,hh,hpp,hxx,h++,rs,py,zig,java,ets"
+        // semcode 0.5.0 起默认索引全部支持语言（跨语言仓库无需 -e）；模型随
+        // 插件分发，向量步骤直传 --model-path，无需用户配置任何路径。
+        val modelArgs = bundledModelDir()?.let { listOf("--model-path", it.absolutePath) } ?: emptyList()
         val steps = listOf(
             "semcode-index (source)" to listOf(
-                bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "-e", extensions,
+                bins.index.absolutePath, "-s", ".", "-d", db.absolutePath,
             ),
             "semcode-index (vectors)" to listOf(
                 bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "--vectors",
-            ),
+            ) + modelArgs,
         )
         for ((label, command) in steps) {
             onLine(">>> $label")
-            val ok = runProcess(command, root) { line -> onLine(line) }
-            if (!ok) {
+            if (!runProcess(command, root) { line ->
+                    onLine(line)
+                    indexLog.add(line.take(500))
+                    if (indexLog.size > 400) {
+                        indexLog.removeAt(0)
+                    }
+                }
+            ) {
                 onLine("ERROR: step failed: $label")
                 return false
             }
         }
+        writeModelMarker()
         return true
+    }
+
+    /**
+     * 换模型后的向量自愈（0.7.0）：捆绑模型的指纹与上次成功跑向量时记录的
+     * 不一致 → 只重跑向量步骤（Rust 端 ensure_vectors_model 会清掉旧空间的
+     * 向量重算）。指纹算法与 Rust 端一致：sha256(model.safetensors) 前 16 hex。
+     * @return true 表示需要并已启动补跑。
+     */
+    fun refreshVectorsIfModelChanged(onLine: (String) -> Unit): Boolean {
+        val fp = bundledModelFingerprint() ?: return false
+        val marker = modelMarkerFile() ?: return false
+        if (marker.isFile && marker.readText().trim() == fp) {
+            return false
+        }
+        val root = projectRoot() ?: return false
+        val bins = resolveBinaries() ?: return false
+        val db = databaseDir()
+        val modelDir = bundledModelDir() ?: return false
+        onLine(">>> semcode-index (vectors, model changed)")
+        val ok = runProcess(
+            listOf(
+                bins.index.absolutePath, "-s", ".", "-d", db.absolutePath,
+                "--vectors", "--model-path", modelDir.absolutePath,
+            ),
+            root,
+        ) { line ->
+            onLine(line)
+            indexLog.add(line.take(500))
+        }
+        if (ok) {
+            writeModelMarker()
+            onLine("Vectors rebuilt for the new embedding model")
+        }
+        return true
+    }
+
+    private fun bundledModelFingerprint(): String? {
+        val dir = bundledModelDir() ?: return null
+        return sha256Prefix(File(dir, "model.safetensors"))
+    }
+
+    private fun modelMarkerFile(): File? =
+        projectRoot()?.let { File(it, ".idea/semcode-model.sha") }
+
+    private fun writeModelMarker() {
+        val fp = bundledModelFingerprint() ?: return
+        modelMarkerFile()?.writeText(fp)
+    }
+
+    private fun sha256Prefix(file: File): String? = try {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { ins ->
+            val buf = ByteArray(1 shl 20)
+            while (true) {
+                val n = ins.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        md.digest().take(8).joinToString("") { "%02x".format(it) }
+    } catch (e: Exception) {
+        log.warn("model fingerprint failed: ${file}", e)
+        null
     }
 
     /** 查询用常驻 MCP 子进程（懒启动，进程死亡自动重启）。 */
@@ -80,13 +221,14 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         val bins = resolveBinaries() ?: return null
         if (client == null) {
             val db = databaseDir()
+            val modelArgs = bundledModelDir()?.let { listOf("--model-path", it.absolutePath) } ?: emptyList()
             client = SemcodeMcpClient(
                 listOf(
                     bins.mcp.absolutePath,
                     "-d", db.absolutePath,
                     "--git-repo", root.absolutePath,
                     "--lazy",
-                ),
+                ) + modelArgs,
                 root,
             )
         }

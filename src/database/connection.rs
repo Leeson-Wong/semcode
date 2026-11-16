@@ -461,6 +461,34 @@ impl DatabaseManager {
         )))
     }
 
+    /// Whether the stored vectors were made by the model now loaded. Vectors
+    /// from different models live in different spaces: mixing them ranks
+    /// neighbours at random, so a change clears the vector tables and the
+    /// update that called this re-embeds everything. An index that never
+    /// recorded a fingerprint counts as changed — its vectors predate the
+    /// mechanism, and re-embedding is cheaper than trusting them.
+    pub async fn ensure_vectors_model(&self, fingerprint: &str) -> Result<bool> {
+        let recorded = self
+            .schema_manager
+            .meta_value("vectors:model_fingerprint")
+            .await?;
+        if recorded.as_deref() == Some(fingerprint) {
+            return Ok(false);
+        }
+        // Drop and recreate rather than delete: a row delete on these tables
+        // was observed to leave rows readable to the next query, and a
+        // rebuilt-looking run that skipped every content hash is worse than
+        // no invalidation at all.
+        for table_name in ["vectors", "commit_vectors", "lore_vectors"] {
+            let _ = self.connection.drop_table(table_name, &[]).await;
+        }
+        self.create_tables().await?;
+        self.schema_manager
+            .set_meta_value("vectors:model_fingerprint", fingerprint)
+            .await?;
+        Ok(true)
+    }
+
     pub async fn create_tables(&self) -> Result<()> {
         self.schema_manager.create_all_tables().await?;
         self.schema_manager.create_scalar_indices().await?;
@@ -3150,16 +3178,35 @@ impl DatabaseManager {
     }
 
     pub async fn update_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        // Vectors left by a different model are noise in this one's space.
+        if self
+            .ensure_vectors_model(vectorizer.model_fingerprint())
+            .await?
+        {
+            tracing::info!("embedding model changed: vector tables cleared for rebuild");
+        }
         self.vector_search_manager.update_vectors(vectorizer).await
     }
 
     pub async fn update_commit_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        if self
+            .ensure_vectors_model(vectorizer.model_fingerprint())
+            .await?
+        {
+            tracing::info!("embedding model changed: vector tables cleared for rebuild");
+        }
         self.vector_search_manager
             .update_commit_vectors(vectorizer)
             .await
     }
 
     pub async fn update_lore_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        if self
+            .ensure_vectors_model(vectorizer.model_fingerprint())
+            .await?
+        {
+            tracing::info!("embedding model changed: vector tables cleared for rebuild");
+        }
         self.vector_search_manager
             .update_lore_vectors(vectorizer)
             .await
@@ -8827,6 +8874,71 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn model_change_clears_vector_tables_for_rebuild() {
+        // A delete-based clear once left rows readable, so a model swap
+        // looked rebuilt while serving stale-space vectors. The drop-based
+        // clear must leave empty, existing tables behind.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        // A vector row in the old model's space.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("content_hash", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 256),
+                false,
+            ),
+        ]));
+        let vector = arrow::array::FixedSizeListArray::from_iter_primitive::<
+            arrow::datatypes::Float32Type,
+            _,
+            _,
+        >(vec![Some(vec![Some(0.1); 256])], 256);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["hash"])) as ArrayRef,
+                Arc::new(vector) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        db.connection
+            .open_table("vectors")
+            .execute()
+            .await
+            .unwrap()
+            .add(vec![batch])
+            .execute()
+            .await
+            .unwrap();
+
+        assert!(db.ensure_vectors_model("aaa:pp2").await.unwrap());
+        for table_name in ["vectors", "commit_vectors", "lore_vectors"] {
+            let count = db
+                .connection
+                .open_table(table_name)
+                .execute()
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{table_name} must be empty after a model change");
+        }
+        // Same fingerprint twice is a no-op.
+        assert!(!db.ensure_vectors_model("aaa:pp2").await.unwrap());
+        // A different fingerprint clears again.
+        assert!(db.ensure_vectors_model("bbb:pp2").await.unwrap());
     }
 
     #[tokio::test]

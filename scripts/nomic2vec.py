@@ -3,7 +3,9 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "torch>=2.0.0",
-#   "transformers>=4.30.0",
+#   # nomic-bert-2048 的自定义 modeling 代码按 transformers 4.x 的 API 写
+#   # （self.get_extended_attention_mask 在 5.x 已移除），钉在 4.x
+#   "transformers>=4.40,<5",
 #   "model2vec[distill]>=0.1.0",
 #   "sentence-transformers>=2.2.0",
 #   "sentencepiece>=0.1.97",
@@ -517,6 +519,26 @@ def main():
         model.get_input_embeddings = types.MethodType(get_input_embeddings, model)
         model.set_input_embeddings = types.MethodType(set_input_embeddings, model)
 
+        # NomicBertModel extends nn.Module directly instead of
+        # PreTrainedModel, so the Mixin methods the distillation forward pass
+        # calls are missing too. Borrow them from ModuleUtilsMixin, skipping
+        # whichever names this transformers version does not define.
+        from transformers.modeling_utils import ModuleUtilsMixin
+        for mixin_method in (
+            "get_extended_attention_mask",
+            "invert_attention_mask",
+            "get_extended_attention_mask_no_dtype",
+        ):
+            if hasattr(model, mixin_method):
+                continue
+            if hasattr(ModuleUtilsMixin, mixin_method):
+                setattr(
+                    model,
+                    mixin_method,
+                    types.MethodType(getattr(ModuleUtilsMixin, mixin_method), model),
+                )
+                print(f"• Patched missing {mixin_method} from ModuleUtilsMixin")
+
         try:
             # Get full stack trace to see where the error is coming from
             import traceback
@@ -625,6 +647,20 @@ def main():
                     # Add [UNK] token at the same score as <unk>
                     unk_score = -12.638995969314884  # Same as <unk>
                     vocab.insert(1, ["[UNK]", unk_score])  # Insert after <pad>
+                    # The vocabulary grew by one: give [UNK] a zero row in the
+                    # embeddings, or every loader refuses the mismatch
+                    # (250000 tokens vs 249999 vectors).
+                    import numpy as np
+                    from safetensors.numpy import load_file, save_file
+                    tensors = load_file(str(output_dir / "model.safetensors"))
+                    emb_name = next(k for k, v in tensors.items() if getattr(v, "ndim", 0) == 2)
+                    if tensors[emb_name].shape[0] == len(vocab) - 1:
+                        tensors[emb_name] = np.vstack(
+                            [tensors[emb_name],
+                             np.zeros((1, tensors[emb_name].shape[1]), dtype=tensors[emb_name].dtype)]
+                        )
+                        save_file(tensors, str(output_dir / "model.safetensors"))
+                        print("  • Appended a zero vector row for [UNK]")
 
                 # Update unk_id to point to the [UNK] token (position 1)
                 tokenizer_config["model"]["unk_id"] = 1
