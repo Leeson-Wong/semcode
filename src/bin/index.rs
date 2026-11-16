@@ -106,6 +106,12 @@ struct Args {
     #[arg(long, value_name = "COMMIT_RANGE")]
     commits: Option<String>,
 
+    /// Recent commits to index alongside a full-tree index. A tree index alone
+    /// records only HEAD, which leaves find_commit / vcommit_similar_commits
+    /// with nothing to search on ordinary projects. 0 disables the walk.
+    #[arg(long, value_name = "COUNT", default_value_t = 200)]
+    commit_history: usize,
+
     /// Number of parallel database inserter threads for git range and commit indexing modes
     #[arg(long, default_value = "2")]
     db_threads: usize,
@@ -1748,6 +1754,60 @@ async fn run_pipeline(args: Args) -> Result<()> {
                 &args.include,
             )
             .await?;
+        }
+
+        // The tree is one commit deep; the history behind it is what makes
+        // the commit tools usable on ordinary projects. Record which branch
+        // the tree was read at (list_branches), and walk the recent history
+        // into git_commits — deduplicated against what is already stored.
+        // `--git` named a range and answered its own question; it gets no
+        // history side effect.
+        if args.git.is_none() {
+            if let Ok(repo) = gix::discover(&args.source) {
+                if args.commit_history > 0 {
+                    match semcode::indexer::list_recent_shas(&repo, args.commit_history) {
+                        Ok(recent) => {
+                            let existing: HashSet<String> = db_manager
+                                .get_all_git_commits()
+                                .await?
+                                .into_iter()
+                                .map(|c| c.git_sha)
+                                .collect();
+                            let new_shas: Vec<String> = recent
+                                .into_iter()
+                                .filter(|sha| !existing.contains(sha))
+                                .collect();
+                            if !new_shas.is_empty() {
+                                println!(
+                                    "{} Indexing commit history ({} new of last {})",
+                                    "→".blue(),
+                                    new_shas.len(),
+                                    args.commit_history
+                                );
+                                semcode::indexer::process_commits_pipeline(
+                                    &args.source,
+                                    new_shas,
+                                    db_manager.clone(),
+                                    100,
+                                    num_cpus::get(),
+                                    existing,
+                                    args.db_threads,
+                                )
+                                .await?;
+                            }
+                        }
+                        Err(e) => warn!("Commit history walk failed, skipping: {}", e),
+                    }
+                }
+                if let (Ok(Some(branch)), Ok(head)) = (
+                    semcode::git::get_current_branch(&args.source),
+                    repo.head_commit(),
+                ) {
+                    db_manager
+                        .record_branch_indexed(&branch, &head.id().to_string(), None)
+                        .await?;
+                }
+            }
         }
     } else {
         println!("Skipping source indexing - vectorization only mode");

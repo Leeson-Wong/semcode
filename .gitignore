@@ -36,3 +36,9 @@ Thumbs.db
 
 # claude
 .claude
+
+# Distillation experiments (reproducible via scripts/nomic2vec.py / distill_2vec.py)
+/nomic_v2_m2v/
+/nomic_v2_pruned/
+/potion_multilingual_pruned/
+/potion_multilingual_pruned_fp16/

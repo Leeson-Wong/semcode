@@ -541,10 +541,34 @@ async fn mcp_show_callers(
             )?;
         }
         Resolution::NotFound => {
-            writeln!(
-                buffer,
-                "Error: Function or macro '{function_name}' not found in database"
-            )?;
+            // A callee the repository does not define is still a callee:
+            // SDK and platform calls (`Log.i`, `TextUtils.equals`) leave
+            // call edges but no row of their own. Answer from the edges,
+            // saying what kind of answer it is (user feedback 2026-11-16).
+            let callers = db
+                .get_function_callers_in(function_name, git_sha, pin)
+                .await?;
+            if callers.is_empty() {
+                writeln!(
+                    buffer,
+                    "Error: Function or macro '{function_name}' not found in database"
+                )?;
+            } else {
+                writeln!(
+                    buffer,
+                    "Info: '{function_name}' is not defined in this repository; callers by call edge alone:"
+                )?;
+                writeln!(buffer, "\n=== Direct Callers ===")?;
+                writeln!(
+                    buffer,
+                    "{} functions call '{}' by name:",
+                    callers.len(),
+                    function_name
+                )?;
+                for (i, caller) in callers.iter().enumerate() {
+                    writeln!(buffer, "  {}. {}", i + 1, caller)?;
+                }
+            }
         }
     }
 
@@ -1727,13 +1751,6 @@ async fn mcp_show_all_commits(
         }
     }
 
-    writeln!(
-        buffer,
-        "\nAll Commits: Found {} commit(s) in database:",
-        all_commits.len()
-    )?;
-    writeln!(buffer, "{}", "=".repeat(80))?;
-
     // Step 3: Apply author/subject/regex/symbol/path filters first
     let filtered_commits: Vec<_> = all_commits
         .iter()
@@ -1800,6 +1817,31 @@ async fn mcp_show_all_commits(
             true
         })
         .collect();
+
+    // The header counts what the filters kept, not what the database holds:
+    // "Found 1" above an empty body (the database count) reads as a promise
+    // the list below does not keep (user feedback 2026-11-16).
+    let any_filter = !author_filters.is_empty()
+        || !subject_filters.is_empty()
+        || !regex_filters.is_empty()
+        || !symbol_filters.is_empty()
+        || !path_filters.is_empty()
+        || params.reachable_sha.is_some();
+    if any_filter {
+        writeln!(
+            buffer,
+            "\nAll Commits: {} of {} indexed commit(s) match the filters:",
+            filtered_commits.len(),
+            all_commits.len()
+        )?;
+    } else {
+        writeln!(
+            buffer,
+            "\nAll Commits: Found {} commit(s) in database:",
+            all_commits.len()
+        )?;
+    }
+    writeln!(buffer, "{}", "=".repeat(80))?;
 
     // Step 4: Build reachable commits set if needed (for > 10 filtered commits)
     let reachable_set = if let Some(reachable_from) = params.reachable_sha {
@@ -1912,10 +1954,7 @@ async fn mcp_show_all_commits(
     writeln!(buffer, "\n{}", "=".repeat(80))?;
 
     // Step 4: Show summary with filtering info
-    if !params.regex_patterns.is_empty()
-        || !params.symbol_patterns.is_empty()
-        || !params.path_patterns.is_empty()
-    {
+    if any_filter {
         writeln!(buffer, "Summary:")?;
         writeln!(buffer, "  Total commits in database: {}", all_commits.len())?;
         writeln!(buffer, "  Matched by filters: {}", matched_count)?;
@@ -1949,6 +1988,20 @@ async fn mcp_show_all_commits(
                     "\nInfo: No commits matched ANY of {} path pattern(s): {}",
                     params.path_patterns.len(),
                     params.path_patterns.join(", ")
+                )?;
+            } else if !params.subject_patterns.is_empty() {
+                writeln!(
+                    buffer,
+                    "\nInfo: No commits matched ANY of {} subject pattern(s): {}",
+                    params.subject_patterns.len(),
+                    params.subject_patterns.join(", ")
+                )?;
+            } else if !params.author_patterns.is_empty() {
+                writeln!(
+                    buffer,
+                    "\nInfo: No commits matched ANY of {} author pattern(s): {}",
+                    params.author_patterns.len(),
+                    params.author_patterns.join(", ")
                 )?;
             }
         }
@@ -6597,6 +6650,58 @@ async fn run_index_project(
         }
         send_notification(format!("Semcode: index_project failed - {}", msg));
         return;
+    }
+
+    // A full rebuild mirrors the CLI: record the branch the tree was read at
+    // and the recent history behind it, so find_commit / vcommit have data
+    // on ordinary projects and list_branches is not empty (user feedback
+    // 2026-11-16). Failures degrade to history-less indexing, not errors.
+    // A gix::Repository is not Sync, so everything it computes is collected
+    // here and the repository is dropped before the first await.
+    if full {
+        // What the repository can say without crossing an await: the recent
+        // history, and the branch name and SHA the tree was read at.
+        struct HistoryFacts {
+            recent: Vec<String>,
+            branch: Option<String>,
+            head: Option<String>,
+        }
+        let collected = (|| {
+            let repo = gix::discover(&repo_path).ok()?;
+            let recent = semcode::indexer::list_recent_shas(&repo, 200).ok()?;
+            let branch = semcode::git::get_current_branch(&repo_path).ok().flatten();
+            let head = repo.head_commit().ok().map(|h| h.id().to_string());
+            Some(HistoryFacts {
+                recent,
+                branch,
+                head,
+            })
+        })();
+        if let Some(facts) = collected {
+            let new_shas: Vec<String> = facts
+                .recent
+                .into_iter()
+                .filter(|sha| !existing_shas.contains(sha))
+                .collect();
+            if !new_shas.is_empty() {
+                if let Err(e) = semcode::indexer::process_commits_pipeline(
+                    &repo_path,
+                    new_shas,
+                    db_manager.clone(),
+                    100,
+                    num_cpus::get(),
+                    existing_shas.clone(),
+                    2,
+                )
+                .await
+                {
+                    eprintln!("[index_project] commit history walk failed: {}", e);
+                }
+            }
+            if let (Some(branch), Some(head)) = (facts.branch, facts.head) {
+                let _ = db_manager.record_branch_indexed(&branch, &head, None).await;
+            }
+        }
     }
 
     if vectors {

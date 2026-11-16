@@ -153,6 +153,27 @@ pub fn list_shas_in_range(repo: &gix::Repository, range: &str) -> Result<Vec<Str
     Ok(shas)
 }
 
+/// The most recent `limit` commits reachable from HEAD, oldest first —
+/// the bounded history a full-tree index records beside the tree itself.
+pub fn list_recent_shas(repo: &gix::Repository, limit: usize) -> Result<Vec<String>> {
+    let head = repo.head_commit()?;
+    let walk = repo
+        .rev_walk([head.id().detach()])
+        .sorting(Sorting::ByCommitTime(Default::default()))
+        .all()?;
+    let mut shas = Vec::with_capacity(limit.min(1024));
+    for info in walk {
+        let info = info?;
+        shas.push(info.id().to_string());
+        if shas.len() >= limit {
+            break;
+        }
+    }
+    // The walk is newest-first; oldest-first matches list_shas_in_range.
+    shas.reverse();
+    Ok(shas)
+}
+
 /// Parse tags from commit message (e.g., Signed-off-by:, Reported-by:, etc.)
 fn parse_commit_message_tags(message: &str) -> std::collections::HashMap<String, Vec<String>> {
     use std::collections::HashMap;
