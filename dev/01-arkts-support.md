@@ -2,6 +2,23 @@
 
 > 评估日期：2026-11-13。结论：语法库现成，不需要自写 parser；纯代码量
 > 300-500 行，MVP 3-5 个工作日。
+>
+> **2026-11-15 已落地**：tree-sitter-arkts 0.3.0 与核心 0.26 直接兼容
+> （评估时的风险点消除）。实现照 Java 模式（dev/01-java-support.md），
+> 当日完成并实测。实装中发现与评估的三处差异：
+> 1. ArkUI 组件调用是语法**专用节点** `arkui_component_expression`
+>    （带子块的 `Column() {...}`），无块的 `Text(...)` 仍是普通
+>    call_expression——统一按名字级记边（跳过会造成不一致，且自定义
+>    组件也走此形态）
+> 2. 参数是 TS 词汇表（required/optional_parameter，与 Java 的
+>    formal_parameter 同容器不同子节点），解析器按子节点分流
+> 3. type_annotation 节点文本自带前导 `:`，return_type/参数类型两侧
+>    都要剥离
+>
+> qualifier 设计：仅类型链（`Index`、`Outer.Inner`），不从文件路径推
+> 模块——ArkTS 源码不声明模块名，路径猜测跨工程布局不可靠。
+> 实战验证：F:/mime/Alterego/apps/harmony（真实鸿蒙工程）230 函数，
+> find_type/file_survey/find_function 全通，引用计数正常。
 
 ## 前提：现成的 ArkTS 语法库
 

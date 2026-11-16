@@ -20,6 +20,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "py",   // Python source files
     "zig",  // Zig source files
     "java", // Java source files
+    "ets",  // ArkTS source files (HarmonyOS)
 ];
 
 /// Default extensions for indexing (subset of SUPPORTED_EXTENSIONS)

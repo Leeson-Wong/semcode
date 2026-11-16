@@ -26,6 +26,7 @@ enum SurveyLanguage {
     Python,
     Zig,
     Java,
+    ArkTs,
 }
 
 impl SurveyLanguage {
@@ -38,6 +39,7 @@ impl SurveyLanguage {
             "py" => Some(Self::Python),
             "zig" => Some(Self::Zig),
             "java" => Some(Self::Java),
+            "ets" => Some(Self::ArkTs),
             _ => None,
         }
     }
@@ -78,7 +80,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
     }
     if !is_supported_for_analysis(path.to_string_lossy().as_ref()) {
         bail!(
-            "unsupported source file '{}'; expected C, C++, Rust, Python, Zig, or Java",
+            "unsupported source file '{}'; expected C, C++, Rust, Python, Zig, Java, or ArkTS",
             path.display()
         );
     }
@@ -94,6 +96,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
         SurveyLanguage::Python => tree_sitter_python::LANGUAGE.into(),
         SurveyLanguage::Zig => tree_sitter_zig::LANGUAGE.into(),
         SurveyLanguage::Java => tree_sitter_java::LANGUAGE.into(),
+        SurveyLanguage::ArkTs => tree_sitter_arkts::LANGUAGE.into(),
     };
     parser.set_language(&grammar)?;
     let tree = parser
@@ -273,6 +276,21 @@ fn is_basic_type(language: SurveyLanguage, name: &str) -> bool {
                 | "void"
                 | "var"
         ),
+        SurveyLanguage::ArkTs => matches!(
+            name,
+            "string"
+                | "number"
+                | "boolean"
+                | "void"
+                | "null"
+                | "undefined"
+                | "object"
+                | "any"
+                | "unknown"
+                | "never"
+                | "bigint"
+                | "symbol"
+        ),
     }
 }
 
@@ -339,6 +357,7 @@ fn walk(node: Node<'_>, source: &[u8], language: SurveyLanguage, out: &mut Surve
         SurveyLanguage::Python => extract_python(node, source, out),
         SurveyLanguage::Zig => extract_zig(node, source, out),
         SurveyLanguage::Java => extract_java(node, source, out),
+        SurveyLanguage::ArkTs => extract_arkts(node, source, out),
     }
 
     let mut cursor = node.walk();
@@ -521,6 +540,68 @@ fn extract_java(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
             {
                 out.types_defined
                     .push((format!("interface {name}"), line(node)));
+            }
+        }
+        "type_identifier" => {
+            if let Some(value) = text(node, source) {
+                increment(&mut out.types_mentioned, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_arkts(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
+    match node.kind() {
+        "function_declaration" | "method_definition" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.functions_defined.push((name, line(node)));
+            }
+        }
+        "call_expression" => {
+            if let Some(name) = node
+                .child_by_field_name("function")
+                .and_then(|n| text(n, source))
+            {
+                increment(&mut out.calls, name);
+            }
+        }
+        "struct_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.types_defined
+                    .push((format!("struct {name}"), line(node)));
+            }
+        }
+        "class_declaration" | "record_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.types_defined
+                    .push((format!("class {name}"), line(node)));
+            }
+        }
+        "interface_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.types_defined
+                    .push((format!("interface {name}"), line(node)));
+            }
+        }
+        "enum_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.types_defined.push((format!("enum {name}"), line(node)));
             }
         }
         "type_identifier" => {

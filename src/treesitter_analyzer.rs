@@ -46,6 +46,7 @@ pub enum Language {
     Python,
     Zig,
     Java,
+    ArkTs,
 }
 
 /// Shared extraction logic: queries, tag encoding, qualifier and guard
@@ -63,6 +64,7 @@ pub const TREE_SITTER_PYTHON_VERSION: &str = "0.25.0";
 pub const TREE_SITTER_RUST_VERSION: &str = "0.24.2";
 pub const TREE_SITTER_ZIG_VERSION: &str = "1.1.2";
 pub const TREE_SITTER_JAVA_VERSION: &str = "0.23.5";
+pub const TREE_SITTER_ARKTS_VERSION: &str = "0.3.0";
 
 /// The extractor version that reads a language: shared logic plus the
 /// grammar that language parses through.
@@ -74,6 +76,7 @@ pub fn extractor_version(language: Language) -> String {
         Language::Rust => format!("tree-sitter-rust-{TREE_SITTER_RUST_VERSION}"),
         Language::Zig => format!("tree-sitter-zig-{TREE_SITTER_ZIG_VERSION}"),
         Language::Java => format!("tree-sitter-java-{TREE_SITTER_JAVA_VERSION}"),
+        Language::ArkTs => format!("tree-sitter-arkts-{TREE_SITTER_ARKTS_VERSION}"),
     };
     format!("{EXTRACTOR_VERSION}+{grammar}")
 }
@@ -89,6 +92,7 @@ pub fn extractor_versions() -> std::collections::HashMap<Language, String> {
         Language::Python,
         Language::Zig,
         Language::Java,
+        Language::ArkTs,
     ]
     .into_iter()
     .map(|language| (language, extractor_version(language)))
@@ -130,6 +134,7 @@ impl Language {
                 "py" => Some(Language::Python),
                 "zig" => Some(Language::Zig),
                 "java" => Some(Language::Java),
+                "ets" => Some(Language::ArkTs),
                 _ => None,
             })
     }
@@ -485,12 +490,14 @@ pub struct TreeSitterAnalyzer {
     python_parser: Parser,
     zig_parser: Parser,
     java_parser: Parser,
+    arkts_parser: Parser,
     c_queries: &'static LanguageQueries,
     cpp_queries: &'static LanguageQueries,
     rust_queries: &'static LanguageQueries,
     python_queries: &'static LanguageQueries,
     zig_queries: &'static LanguageQueries,
     java_queries: &'static LanguageQueries,
+    arkts_queries: &'static LanguageQueries,
     /// Read `.h` files as C++ instead of the default C. Per-index state,
     /// recorded in `schema_meta` when the index is built; off everywhere
     /// else, including every test.
@@ -548,6 +555,11 @@ impl TreeSitterAnalyzer {
         let mut java_parser = Parser::new();
         java_parser.set_language(&java_language)?;
 
+        // Initialize ArkTS parser and queries
+        let arkts_language = tree_sitter_arkts::LANGUAGE.into();
+        let mut arkts_parser = Parser::new();
+        arkts_parser.set_language(&arkts_language)?;
+
         // Compiled once for the process, not once per analyzer: see
         // c_queries() below.
         let c_queries = Self::c_queries()?;
@@ -556,6 +568,7 @@ impl TreeSitterAnalyzer {
         let python_queries = Self::python_queries()?;
         let zig_queries = Self::zig_queries()?;
         let java_queries = Self::java_queries()?;
+        let arkts_queries = Self::arkts_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
@@ -564,12 +577,14 @@ impl TreeSitterAnalyzer {
             python_parser,
             zig_parser,
             java_parser,
+            arkts_parser,
             c_queries,
             cpp_queries,
             rust_queries,
             python_queries,
             zig_queries,
             java_queries,
+            arkts_queries,
             headers_as_cpp: false,
         })
     }
@@ -673,6 +688,18 @@ impl TreeSitterAnalyzer {
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("Java queries: {e}"))
+    }
+
+    fn arkts_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_arkts_queries(&tree_sitter_arkts::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("ArkTS queries: {e}"))
     }
 
     fn create_c_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
@@ -1662,6 +1689,136 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    fn create_arkts_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // A TypeScript-lineage grammar: named and arrow-assigned functions
+        // both carry the method shape, and `build()` inside an ArkUI struct
+        // is an ordinary method_definition. Return annotations are optional
+        // in the grammar, so unannotated functions fall back to the shared
+        // before-the-name reader (modifiers like `async` survive it).
+        let function_query = Query::new(
+            language,
+            r#"
+            (function_declaration
+                name: (identifier) @function_name
+                parameters: (formal_parameters) @parameters
+                return_type: (type_annotation)? @return_type
+                body: (statement_block) @body
+            ) @function
+
+            (method_definition
+                name: (property_identifier) @function_name
+                parameters: (formal_parameters) @parameters
+                return_type: (type_annotation)? @return_type
+                body: (statement_block) @body
+            ) @function
+
+            (variable_declarator
+                name: (identifier) @function_name
+                value: (arrow_function
+                    parameters: (formal_parameters) @parameters
+                    return_type: (type_annotation)? @return_type
+                    body: (_) @body
+                )
+            ) @function
+        "#,
+        )?;
+
+        let comment_query = Query::new(
+            language,
+            r#"
+            (comment) @comment
+        "#,
+        )?;
+
+        // The ArkUI `struct` is the type-level unit a page is built from,
+        // beside the TypeScript shapes.
+        let type_query = Query::new(
+            language,
+            r#"
+            (struct_declaration
+                name: (type_identifier) @type_name
+                body: (struct_body) @body
+            ) @struct
+
+            (class_declaration
+                name: (type_identifier) @type_name
+                body: (class_body) @body
+            ) @class
+
+            (interface_declaration
+                name: (type_identifier) @type_name
+                body: (interface_body) @body
+            ) @interface
+
+            (enum_declaration
+                name: (identifier) @type_name
+                body: (enum_body) @body
+            ) @enum
+        "#,
+        )?;
+
+        // Decorators occupy the macro slot and are read but never stored,
+        // the Python and Java treatment: nothing about @Component is
+        // function-like.
+        let macro_query = Query::new(
+            language,
+            r#"
+            (decorator
+                (identifier) @macro_name
+            ) @annotation
+
+            (decorator
+                (call_expression
+                    function: (identifier) @macro_name
+                )
+            ) @annotation
+        "#,
+        )?;
+
+        // Bare calls name their callee directly; member calls contribute
+        // the property name at name level — ArkTS spells most calls
+        // `obj.method()`, so member-only silence would empty the call
+        // graph. `this.x()` additionally earns its tagged edge. ArkUI
+        // component calls (Column(), Text()) read as bare calls and land
+        // as edges to names no row defines — noise the call-graph tool
+        // descriptions already disclose.
+        let call_query = Query::new(
+            language,
+            r#"
+            (call_expression
+                function: (identifier) @function_name
+            ) @call
+
+            (arkui_component_expression
+                function: (identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (member_expression
+                    property: (property_identifier) @function_name
+                )
+            ) @call
+
+            (call_expression
+                function: (member_expression
+                    object: (_) @receiver
+                    property: (property_identifier) @member_name
+                    (#eq? @receiver "this")
+                )
+            ) @method_call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None, // ArkTS doesn't have typedefs
+            macro_query,
+            call_query,
+        })
+    }
+
     fn create_zig_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
         // Named functions and tests. Anonymous `fn` types have no name field
         // and are left to the type query. `!body` is the extern/declaration
@@ -1800,6 +1957,7 @@ impl TreeSitterAnalyzer {
             Language::Python => &mut self.python_parser,
             Language::Zig => &mut self.zig_parser,
             Language::Java => &mut self.java_parser,
+            Language::ArkTs => &mut self.arkts_parser,
         }
     }
 
@@ -1812,6 +1970,7 @@ impl TreeSitterAnalyzer {
             Language::Python => self.python_queries,
             Language::Zig => self.zig_queries,
             Language::Java => self.java_queries,
+            Language::ArkTs => self.arkts_queries,
         }
     }
 
@@ -3593,7 +3752,7 @@ impl TreeSitterAnalyzer {
         let owner = qualifier?;
         let receiver = site.receiver_expr.as_deref()?;
         let is_self = match language {
-            Language::Cpp | Language::Java => receiver == "this",
+            Language::Cpp | Language::Java | Language::ArkTs => receiver == "this",
             // `this`/`self` names the enclosing type (C++ class, Python
             // class, Rust impl), so the call resolves against a known owner
             // instead of falling through to the dispatch table, where a
@@ -4859,9 +5018,9 @@ impl TreeSitterAnalyzer {
                     Language::C | Language::Cpp => Self::guard_of(node, ctx.source),
                     Language::Python => Self::python_guard(node, ctx.source),
                     Language::Zig => Self::zig_guard(node, ctx.source),
-                    // Java has no conditional compilation; a method is
-                    // always compiled.
-                    Language::Java => None,
+                    // Java and ArkTS have no conditional compilation; a
+                    // method is always compiled.
+                    Language::Java | Language::ArkTs => None,
                 }),
                 qualifier,
             };
@@ -5634,6 +5793,17 @@ impl TreeSitterAnalyzer {
         }
 
         if node.kind() == "formal_parameters" {
+            // Java spells each child formal_parameter/spread_parameter;
+            // the TypeScript lineage ArkTS comes from spells them
+            // required_parameter/optional_parameter. The container is
+            // the same kind, so the children decide the reader.
+            let mut cursor = node.walk();
+            let ts_style = node
+                .children(&mut cursor)
+                .any(|child| matches!(child.kind(), "required_parameter" | "optional_parameter"));
+            if ts_style {
+                return Self::parse_ts_parameters(node, source);
+            }
             return Self::parse_java_parameters(node, source);
         }
 
@@ -5897,7 +6067,15 @@ impl TreeSitterAnalyzer {
                     line_start = node.start_position().row as u32 + 1;
                 }
                 "return_type" => {
-                    return_type = Some(text.to_string());
+                    // A TypeScript-lineage annotation keeps its leading
+                    // ':' in node text; no other language's type starts
+                    // with one, so stripping is safe universally.
+                    return_type = Some(
+                        text.strip_prefix(':')
+                            .map(str::trim)
+                            .unwrap_or(text)
+                            .to_string(),
+                    );
                 }
                 "parameters" => {
                     parameters = self.parse_parameters_from_node(node, ctx.source);
@@ -6915,8 +7093,40 @@ impl TreeSitterAnalyzer {
             Language::Python => Self::python_owner_qualifier(node, source, file_path),
             Language::Zig => Self::zig_owner_qualifier(node, source, file_path),
             Language::Java => Self::java_owner_qualifier(node, source),
+            Language::ArkTs => Self::arkts_owner_qualifier(node, source),
             Language::C => None,
         }
+    }
+
+    /// The entity owning an ArkTS definition: the chain of enclosing types,
+    /// outermost first. ArkTS states no module name in the source, and a
+    /// path-to-module guess would be wrong as often as right across
+    /// app layouts, so the qualifier is the type chain alone — `Index`
+    /// for a page struct's `build`, `Outer.Inner` for nesting.
+    fn arkts_owner_qualifier(defined_at: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut scopes = Vec::new();
+        let mut parent = defined_at.parent();
+        while let Some(current) = parent {
+            if matches!(
+                current.kind(),
+                "struct_declaration"
+                    | "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+            ) {
+                if let Some(name) = current.child_by_field_name("name") {
+                    if let Ok(text) = name.utf8_text(source.as_bytes()) {
+                        scopes.push(text.to_string());
+                    }
+                }
+            }
+            parent = current.parent();
+        }
+        if scopes.is_empty() {
+            return None;
+        }
+        scopes.reverse();
+        Some(scopes.join("."))
     }
 
     /// The entity owning a Java definition: the declared package plus every
@@ -7173,6 +7383,40 @@ impl TreeSitterAnalyzer {
                 }
                 _ => continue,
             };
+            if name.is_empty() && type_name.is_empty() {
+                continue;
+            }
+            parameters.push(ParameterInfo {
+                name,
+                type_name,
+                type_file_path: None,
+                type_git_file_hash: None,
+            });
+        }
+        parameters
+    }
+
+    /// TypeScript-lineage parameters, as ArkTS writes them: the name sits
+    /// in a pattern (an identifier, or a destructuring form read as its
+    /// source text), and the type is an annotation whose text keeps its
+    /// leading ':' until stripped here.
+    fn parse_ts_parameters(node: tree_sitter::Node, source: &str) -> Vec<ParameterInfo> {
+        let mut parameters = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if !matches!(child.kind(), "required_parameter" | "optional_parameter") {
+                continue;
+            }
+            let name = child
+                .child_by_field_name("pattern")
+                .or_else(|| child.child_by_field_name("name"))
+                .map(|n| source[n.byte_range()].to_string())
+                .unwrap_or_default();
+            let type_name = child
+                .child_by_field_name("type")
+                .map(|n| collapse_whitespace(&source[n.byte_range()]))
+                .map(|t| t.trim_start_matches(':').trim().to_string())
+                .unwrap_or_default();
             if name.is_empty() && type_name.is_empty() {
                 continue;
             }
@@ -10552,6 +10796,10 @@ test "helper ok" {
             Language::from_path(Path::new("src/main/App.java")),
             Some(Language::Java)
         );
+        assert_eq!(
+            Language::from_path(Path::new("entry/src/main/ets/pages/Index.ets")),
+            Some(Language::ArkTs)
+        );
     }
 
     #[test]
@@ -10738,6 +10986,7 @@ mod rust_receiver_tests {
             ("tree-sitter-rust", TREE_SITTER_RUST_VERSION),
             ("tree-sitter-zig", TREE_SITTER_ZIG_VERSION),
             ("tree-sitter-java", TREE_SITTER_JAVA_VERSION),
+            ("tree-sitter-arkts", TREE_SITTER_ARKTS_VERSION),
         ] {
             assert_eq!(
                 versions.get(krate).map(String::as_str),
@@ -11414,6 +11663,197 @@ mod rust_receiver_tests {
                 tagged("format", "com.example.app.Service"),
             ],
             "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn arkts_definitions_carry_struct_and_owner() {
+        // ArkTS owners are the enclosing type chain alone — the source
+        // states no module name, and a path-to-module guess would be wrong
+        // as often as right across app layouts. A page struct's build()
+        // and methods carry the struct; a free function carries nothing.
+        let source = "import { http } from '@kit.NetworkKit'\n\
+             \n\
+             interface Loadable {\n\
+             \tload(): void\n\
+             }\n\
+             \n\
+             enum Status { Idle, Busy }\n\
+             \n\
+             @Entry\n\
+             @Component\n\
+             struct Index {\n\
+             \t@State message: string = 'hello'\n\
+             \n\
+             \tasync fetch(url: string, opts?: Loadable): Promise<void> {\n\
+             \t\tthis.render('x')\n\
+             \t}\n\
+             \n\
+             \trender(data: string): void {\n\
+             \t\tthis.message = data\n\
+             \t}\n\
+             \n\
+             \tbuild() {\n\
+             \t\tColumn() {\n\
+             \t\t\tText(this.message)\n\
+             \t\t}\n\
+             \t}\n\
+             }\n\
+             \n\
+             function helper(input: Loadable): void {\n\
+             \tlog(input)\n\
+             }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                source,
+                std::path::Path::new("entry/src/main/ets/pages/Index.ets"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let mut found: Vec<(String, Option<String>)> = analysis
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.qualifier.clone()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("build".to_string(), Some("Index".to_string())),
+                ("fetch".to_string(), Some("Index".to_string())),
+                ("helper".to_string(), None),
+                ("render".to_string(), Some("Index".to_string())),
+            ],
+            "{found:?}"
+        );
+
+        let mut type_kinds: Vec<(String, String)> = analysis
+            .types
+            .iter()
+            .map(|t| (t.name.clone(), t.kind.clone()))
+            .collect();
+        type_kinds.sort();
+        assert_eq!(
+            type_kinds,
+            vec![
+                ("Index".to_string(), "struct".to_string()),
+                ("Loadable".to_string(), "interface".to_string()),
+                ("Status".to_string(), "enum".to_string()),
+            ],
+            "{type_kinds:?}"
+        );
+    }
+
+    #[test]
+    fn arkts_methods_carry_params_calls_and_skip_decorators() {
+        // Decorators occupy the macro slot and store nothing (no
+        // @Component noise), unannotated build() falls back to void, and
+        // every call — bare, member, ArkUI component — contributes a
+        // name-level edge, with this-receiver calls additionally tagged
+        // with their owner.
+        let source = "import { http } from '@kit.NetworkKit'\n\
+             \n\
+             @Entry\n\
+             @Component\n\
+             struct Index {\n\
+             \t@State message: string = 'hello'\n\
+             \n\
+             \tasync fetch(url: string): Promise<void> {\n\
+             \t\tconst resp = http.createHttp().request(url)\n\
+             \t\tthis.render(resp)\n\
+             \t\thelper(resp)\n\
+             \t}\n\
+             \n\
+             \trender(data: string): void {\n\
+             \t\tthis.message = data\n\
+             \t}\n\
+             \n\
+             \tbuild() {\n\
+             \t\tColumn() {\n\
+             \t\t\tText(this.message)\n\
+             \t\t}\n\
+             \t}\n\
+             }\n\
+             \n\
+             function helper(input: string): void {\n\
+             \tlog(input)\n\
+             }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                source,
+                std::path::Path::new("entry/src/main/ets/pages/Index.ets"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            analysis.macros.is_empty(),
+            "decorators must not be stored: {:?}",
+            analysis.macros
+        );
+
+        let fetch = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "fetch")
+            .unwrap();
+        assert_eq!(fetch.return_type, "Promise<void>");
+        let params: Vec<(String, String)> = fetch
+            .parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.type_name.clone()))
+            .collect();
+        assert_eq!(
+            params,
+            vec![("url".to_string(), "string".to_string())],
+            "{params:?}"
+        );
+
+        let mut calls = fetch.calls.clone().unwrap_or_default();
+        calls.sort();
+        calls.dedup();
+        assert_eq!(
+            calls,
+            vec![
+                plain("createHttp"),
+                plain("helper"),
+                plain("render"),
+                plain("request"),
+                tagged("render", "Index"),
+            ],
+            "{calls:?}"
+        );
+
+        let build = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "build")
+            .unwrap();
+        assert_eq!(build.return_type, "void");
+        let mut build_calls = build.calls.clone().unwrap_or_default();
+        build_calls.sort();
+        build_calls.dedup();
+        assert_eq!(
+            build_calls,
+            vec![plain("Column"), plain("Text")],
+            "{build_calls:?}"
+        );
+
+        let helper = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "helper")
+            .unwrap();
+        assert_eq!(
+            helper.calls.clone().unwrap_or_default(),
+            vec![plain("log")],
+            "{:?}",
+            analysis.functions
         );
     }
 
