@@ -47,28 +47,38 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         semcodeExe(dir, "semcode-index").isFile &&
             semcodeExe(dir, "semcode-mcp").isFile
 
-    /** zip 内 semcode-intellij/bin/（三个 exe 随插件分发）。 */
-    private fun bundledBinariesDir(): File? {
-        val jar = runCatching {
-            File(javaClass.protectionDomain.codeSource.location.toURI())
-        }.getOrNull() ?: return null
-        val dir = File(jar.parentFile, "bin")
-        return dir.takeIf { hasAll(it) }
-    }
+    /**
+     * zip 内 semcode-intellij/bin/。插件根见 [pluginDir]——protectionDomain
+     * 在 IDEA 2026.3 的类加载器下定位不到插件目录（2026-11-17 实测报
+     * binaries not found），DevEco 平台又未暴露 PluginDescriptor，资源
+     * 定位是唯一两条路都走得通的。
+     */
+    private fun bundledBinariesDir(): File? =
+        pluginDir()?.resolve("bin")?.toFile()?.takeIf { hasAll(it) }
 
     /**
      * 随插件 zip 分发的 model2vec 目录（zip 内 semcode-intellij/model/）。
-     * 从本类 jar 的位置反推插件根（DevEco 平台未暴露 PluginManagerCore，
-     * 且 protectionDomain 不依赖任何平台 API）；存在即用——向量步骤和
-     * MCP 都拿它当 --model-path，用户零配置；缺失（开发期沙箱未带模型）
-     * 返回 null，semcode 回退自己的缓存目录。
+     * 存在即用——向量步骤和 MCP 都拿它当 --model-path，用户零配置；
+     * 缺失（开发期沙箱未带模型）返回 null，semcode 回退自己的缓存目录。
      */
-    fun bundledModelDir(): File? {
+    fun bundledModelDir(): File? =
+        pluginDir()?.resolve("model")?.toFile()?.takeIf { File(it, "model.safetensors").isFile }
+
+    /**
+     * 插件安装根 <plugins>/semcode-intellij/。通过类加载器解析本插件 jar
+     * 内的 plugin.xml 资源反推——资源 URL 对任何类加载器（IDEA 2026.3、
+     * DevEco 243、沙箱 runIde）都成立，jar 再上一级就是插件根。
+     */
+    private fun pluginDir(): java.nio.file.Path? {
+        val res = javaClass.classLoader.getResource("META-INF/plugin.xml") ?: return null
+        // 形如 jar:file:/E:/.../lib/semcode-intellij.jar!/META-INF/plugin.xml
         val jar = runCatching {
-            File(javaClass.protectionDomain.codeSource.location.toURI())
+            File(java.net.URI(res.file.substringBefore('!')))
         }.getOrNull() ?: return null
-        val dir = File(jar.parentFile, "model")
-        return dir.takeIf { File(dir, "model.safetensors").isFile }
+        // jar 位于 <plugin>/lib/ 下；确认父目录确有 lib，避免误判到别处
+        return jar.parentFile?.parentFile?.toPath()?.takeIf { root ->
+            root.resolve("lib").toFile().isDirectory
+        }
     }
 
     fun projectRoot(): File? = project.basePath?.let { File(it) }
