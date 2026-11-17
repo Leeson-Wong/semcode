@@ -37,7 +37,7 @@ class SemcodeStartupActivity : ProjectActivity {
                     ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Semcode workspace indexing", true) {
                         override fun run(indicator: ProgressIndicator) {
                             indicator.isIndeterminate = true
-                            val ok = service.runIndexChain { line -> indicator.text = line.take(120) }
+                            val ok = service.runIndexChain({ line -> indicator.text = line.take(120) }, { indicator.isCanceled })
                             if (ok) {
                                 notify(project, "Semcode workspace index ready — search in the Semcode tool window; Claude Code entry written to .mcp.json")
                             }
@@ -78,7 +78,7 @@ class SemcodeStartupActivity : ProjectActivity {
             ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Semcode indexing", true) {
                 override fun run(indicator: ProgressIndicator) {
                     indicator.isIndeterminate = true
-                    val ok = service.runIndexChain { line -> indicator.text = line.take(120) }
+                    val ok = service.runIndexChain({ line -> indicator.text = line.take(120) }, { indicator.isCanceled })
                     if (ok) {
                         notify(project, "Semcode index ready — search in the Semcode tool window; Claude Code entry written to .mcp.json")
                     }

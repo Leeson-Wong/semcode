@@ -29,6 +29,18 @@ pub mod lore_writers;
 pub mod pages;
 pub mod search;
 
+/// Worker threads for CPU-bound indexing pipelines. `SEMCODE_WORKERS` caps it
+/// (the plugin passes half the cores so a running index leaves the machine
+/// usable); unset or invalid = all cores.
+pub fn worker_limit() -> usize {
+    std::env::var("SEMCODE_WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(num_cpus::get)
+        .max(1)
+}
+
 // Re-export the main types and structs
 pub use database::processed_files::ProcessedFileRecord;
 pub use database::resolution::{Evidence, IndirectCaller};

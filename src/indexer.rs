@@ -1204,7 +1204,7 @@ pub async fn index_git_commits(
 
     // Process commits using streaming pipeline
     let batch_size = 100;
-    let num_workers = num_cpus::get();
+    let num_workers = crate::worker_limit();
 
     process_commits_pipeline(
         repo_path,

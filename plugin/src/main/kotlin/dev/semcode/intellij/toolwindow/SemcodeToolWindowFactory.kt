@@ -236,10 +236,13 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Semcode indexing", true) {
                 override fun run(indicator: ProgressIndicator) {
                     indicator.isIndeterminate = true
-                    val ok = service().runIndexChain { line ->
-                        lines.add(line)
-                        indicator.text = line.take(120)
-                    }
+                    val ok = service().runIndexChain(
+                        { line ->
+                            lines.add(line)
+                            indicator.text = line.take(120)
+                        },
+                        cancelled = { indicator.isCanceled },
+                    )
                     SwingUtilities.invokeLater {
                         refreshStatus()
                         if (ok) {

@@ -1373,7 +1373,7 @@ pub async fn process_git_tree(
     }
 
     // Determine number of workers
-    let num_workers = num_cpus::get().max(1);
+    let num_workers = crate::worker_limit();
     info!(
         "Starting tree streaming pipeline with {} worker threads",
         num_workers
@@ -1572,7 +1572,7 @@ pub async fn process_git_range(
             // Use the optimized streaming pipeline from --commits mode
             // This provides: pre-filtering, streaming, parallel workers, parallel DB insertion
             let batch_size = 100;
-            let num_workers = num_cpus::get();
+            let num_workers = crate::worker_limit();
 
             process_commits_pipeline(
                 repo_path,
@@ -1598,7 +1598,7 @@ pub async fn process_git_range(
 
     // Step 2: Determine number of workers
     // Since generators are I/O bound and workers are CPU bound, use a balanced approach
-    let num_workers = (num_cpus::get()).max(1);
+    let num_workers = crate::worker_limit();
     info!(
         "Starting streaming pipeline with up to 32 generator threads and {} worker threads",
         num_workers

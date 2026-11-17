@@ -138,7 +138,10 @@ class SemcodeProcessService(private val project: Project) : Disposable {
      * 链式跑两步索引。每步输出行回调 [onLine]（进度展示）并进入共享日志，
      * 全部成功返回 true。重入保护：已在跑则拒绝并返回 false。
      */
-    fun runIndexChain(onLine: (String) -> Unit): Boolean {
+    fun runIndexChain(
+        onLine: (String) -> Unit,
+        cancelled: () -> Boolean = { false },
+    ): Boolean {
         if (indexRunning) {
             onLine("ERROR: indexing already in progress")
             return false
@@ -147,7 +150,7 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         indexLog.clear()
         indexListeners.forEach { it(true) }
         try {
-            val ok = runIndexChainInner(onLine)
+            val ok = runIndexChainInner(onLine, cancelled)
             if (ok) {
                 SemcodeAgentConfig.ensure(project, this)
             }
@@ -197,7 +200,7 @@ class SemcodeProcessService(private val project: Project) : Disposable {
     fun workspaceDbRoot(): File? =
         projectRoot()?.let { File(it, ".idea/semcode.dbs") }
 
-    private fun runIndexChainInner(onLine: (String) -> Unit): Boolean {
+    private fun runIndexChainInner(onLine: (String) -> Unit, cancelled: () -> Boolean): Boolean {
         val root = projectRoot() ?: run {
             onLine("ERROR: project has no base path")
             return false
@@ -207,7 +210,7 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         // 约定一致。
         val repos = workspaceRepos()
         if (repos.isNotEmpty()) {
-            return runWorkspaceIndex(repos, onLine)
+            return runWorkspaceIndex(repos, onLine, cancelled)
         }
         // semcode 按 git commit 索引，非 git 项目必然失败（2026-11-17 实测，
         // 索引器的原始报错在通知里只剩 "step failed"）。在这里说明，而不是
@@ -245,14 +248,18 @@ class SemcodeProcessService(private val project: Project) : Disposable {
             ) + modelArgs,
         )
         for ((label, command) in steps) {
+            if (cancelled()) {
+                onLine("Indexing interrupted before $label")
+                return false
+            }
             onLine(">>> $label")
-            if (!runProcess(command, root) { line ->
+            if (!runProcess(command, root, { line ->
                     onLine(line)
                     indexLog.add(line.take(500))
                     if (indexLog.size > 400) {
                         indexLog.removeAt(0)
                     }
-                }
+                }, cancelled)
             ) {
                 onLine("ERROR: step failed: $label")
                 return false
@@ -267,7 +274,11 @@ class SemcodeProcessService(private val project: Project) : Disposable {
      * 在其内写 .semcode.db，与 semcode-mcp --workspace 的读取约定一致）。
      * 一个仓库失败即停——半途继续会让 status 里留着静默缺失的仓库。
      */
-    private fun runWorkspaceIndex(repos: List<File>, onLine: (String) -> Unit): Boolean {
+    private fun runWorkspaceIndex(
+        repos: List<File>,
+        onLine: (String) -> Unit,
+        cancelled: () -> Boolean,
+    ): Boolean {
         val bins = resolveBinaries() ?: run {
             onLine("ERROR: semcode binaries not found — set them in Settings | Tools | Semcode")
             return false
@@ -276,13 +287,19 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         val modelArgs = bundledModelDir()?.let { listOf("--model-path", it.absolutePath) } ?: emptyList()
         onLine("Workspace: ${repos.size} repositories")
         for ((i, repo) in repos.withIndex()) {
+            if (cancelled()) {
+                onLine("Indexing interrupted — ${repos.size - i} repositories left untouched")
+                return false
+            }
             val name = repo.name
             val db = File(dbRoot, name)
             onLine(">>> [${i + 1}/${repos.size}] $name (source)")
             if (!runProcess(
                     listOf(bins.index.absolutePath, "-s", ".", "-d", db.absolutePath),
                     repo,
-                ) { line -> onLine(line); indexLog.add(line.take(500)) }
+                    { line -> onLine(line); indexLog.add(line.take(500)) },
+                    cancelled,
+                )
             ) {
                 onLine("ERROR: source indexing failed for $name")
                 return false
@@ -291,7 +308,9 @@ class SemcodeProcessService(private val project: Project) : Disposable {
             if (!runProcess(
                     listOf(bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "--vectors") + modelArgs,
                     repo,
-                ) { line -> onLine(line); indexLog.add(line.take(500)) }
+                    { line -> onLine(line); indexLog.add(line.take(500)) },
+                    cancelled,
+                )
             ) {
                 onLine("ERROR: vector step failed for $name")
                 return false
@@ -324,10 +343,11 @@ class SemcodeProcessService(private val project: Project) : Disposable {
                 "--vectors", "--model-path", modelDir.absolutePath,
             ),
             root,
-        ) { line ->
-            onLine(line)
-            indexLog.add(line.take(500))
-        }
+            { line ->
+                onLine(line)
+                indexLog.add(line.take(500))
+            },
+        )
         if (ok) {
             writeModelMarker()
             onLine("Vectors rebuilt for the new embedding model")
@@ -395,12 +415,39 @@ class SemcodeProcessService(private val project: Project) : Disposable {
 
     private var client: SemcodeMcpClient? = null
 
-    private fun runProcess(command: List<String>, workDir: File, onLine: (String) -> Unit): Boolean {
+    /** 索引资源上限（用户 2026-11-17 要求）：默认一半核数（≥2），
+     *  通过 SEMCODE_WORKERS 传给 Rust 端的 worker_limit()。 */
+    private fun workerLimit(): Int =
+        (Runtime.getRuntime().availableProcessors() / 2).coerceIn(2, 16)
+
+    /** 当前索引子进程（取消/关项目时强杀，别留孤儿锁着 exe）。 */
+    @Volatile
+    private var currentProcess: Process? = null
+
+    private fun runProcess(
+        command: List<String>,
+        workDir: File,
+        onLine: (String) -> Unit,
+        cancelled: () -> Boolean = { false },
+    ): Boolean {
         return try {
             val process = ProcessBuilder(command)
                 .directory(workDir)
                 .redirectErrorStream(true)
+                .apply { environment()["SEMCODE_WORKERS"] = workerLimit().toString() }
                 .start()
+            currentProcess = process
+            // 看门狗：进度条取消 / 项目关闭 → 强杀子进程。没有它，取消按钮
+            // 只是摆设，进程必跑到完（2026-11-17 用户反馈）。
+            val watchdog = Thread {
+                while (process.isAlive) {
+                    if (cancelled() || disposed) {
+                        process.destroyForcibly()
+                        return@Thread
+                    }
+                    Thread.sleep(200)
+                }
+            }.apply { isDaemon = true; start() }
             val output = StringBuilder()
             process.inputStream.bufferedReader(StandardCharsets.UTF_8).useLines { lines ->
                 for (line in lines) {
@@ -408,7 +455,12 @@ class SemcodeProcessService(private val project: Project) : Disposable {
                     onLine(line)
                 }
             }
+            watchdog.interrupt()
             val code = process.waitFor()
+            if (cancelled() || disposed) {
+                onLine("Indexing interrupted")
+                return false
+            }
             if (code != 0) {
                 log.warn("process exited $code: ${command.first()} — last output: ${output.takeLast(500)}")
             }
@@ -417,10 +469,17 @@ class SemcodeProcessService(private val project: Project) : Disposable {
             log.warn("failed to run ${command.first()}", e)
             onLine("ERROR: ${e.message}")
             false
+        } finally {
+            currentProcess = null
         }
     }
 
+    @Volatile
+    private var disposed = false
+
     override fun dispose() {
+        disposed = true
+        currentProcess?.destroyForcibly()
         client?.teardown()
         client = null
     }
