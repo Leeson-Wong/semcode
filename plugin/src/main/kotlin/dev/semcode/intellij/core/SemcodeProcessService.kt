@@ -36,7 +36,7 @@ class SemcodeProcessService(private val project: Project) : Disposable {
                 )
             }
         }
-        val bundled = bundledBinariesDir() ?: return null
+        val bundled = executableBinariesDir() ?: return null
         return Binaries(
             semcodeExe(bundled, "semcode-index"),
             semcodeExe(bundled, "semcode-mcp"),
@@ -55,6 +55,41 @@ class SemcodeProcessService(private val project: Project) : Disposable {
      */
     private fun bundledBinariesDir(): File? =
         pluginDir()?.resolve("bin")?.toFile()?.takeIf { hasAll(it) }
+
+    /**
+     * 可执行文件的暂存目录（0.9.4）：Windows 锁定运行中的 exe，插件一旦从
+     * 自己的安装目录启动过子进程，IDE 更新/卸载就会 Access Denied（2026-11-17
+     * 实测）。所以捆绑 exe 先拷到 ~/.semcode/plugin/<指纹>/ 再从那里执行——
+     * 插件目录里的文件只被读取，永不被进程锁定，更新随时可做。
+     * 指纹取 semcode-index.exe 的 sha256 前缀：二进制变了换目录，同版本秒过。
+     */
+    @Volatile
+    private var stagedBinaries: File? = null
+
+    private fun executableBinariesDir(): File? {
+        stagedBinaries?.let { return it }
+        val src = bundledBinariesDir() ?: return null
+        val fp = sha256Prefix(File(src, "semcode-index.exe")) ?: return null
+        val stage = File(File(System.getProperty("user.home"), ".semcode/plugin"), fp)
+        val index = File(stage, "semcode-index.exe")
+        val mcp = File(stage, "semcode-mcp.exe")
+        if (!(index.isFile && mcp.isFile)) {
+            runCatching {
+                stage.mkdirs()
+                File(src, "semcode-index.exe").copyTo(index, overwrite = true)
+                File(src, "semcode-mcp.exe").copyTo(mcp, overwrite = true)
+            }.onFailure {
+                log.warn("staging bundled binaries failed, running from plugin dir: $it")
+                return src
+            }
+            // 清掉旧指纹的暂存目录，避免堆积（每个 ~400MB 解压体积的拷贝）
+            stage.parentFile?.listFiles()?.forEach { old ->
+                if (old != stage && old.isDirectory) runCatching { old.deleteRecursively() }
+            }
+        }
+        stagedBinaries = stage
+        return stage
+    }
 
     /**
      * 随插件 zip 分发的 model2vec 目录（zip 内 semcode-intellij/model/）。
