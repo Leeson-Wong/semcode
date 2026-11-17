@@ -1141,24 +1141,38 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let types_clone = inserted_types.clone();
     let batches_sent_clone = batches_sent.clone();
     let batches_inserted_clone = batches_inserted.clone();
-    let progress_thread = std::thread::spawn(move || loop {
-        let files = processed_clone.load(Ordering::Relaxed);
-        let funcs = functions_clone.load(Ordering::Relaxed);
-        let types = types_clone.load(Ordering::Relaxed);
-        let sent = batches_sent_clone.load(Ordering::Relaxed);
-        let inserted = batches_inserted_clone.load(Ordering::Relaxed);
-        let pending = sent.saturating_sub(inserted);
+    let progress_thread = std::thread::spawn(move || {
+        // The indicatif spinner is invisible through a pipe (the plugin and
+        // CI capture stdout), so the same numbers also go out as plain lines
+        // every ~2s — but only when they moved, so a fully deduplicated
+        // incremental run stays silent.
+        let mut tick: u32 = 0;
+        let mut last_files = 0usize;
+        loop {
+            let files = processed_clone.load(Ordering::Relaxed);
+            let funcs = functions_clone.load(Ordering::Relaxed);
+            let types = types_clone.load(Ordering::Relaxed);
+            let sent = batches_sent_clone.load(Ordering::Relaxed);
+            let inserted = batches_inserted_clone.load(Ordering::Relaxed);
+            let pending = sent.saturating_sub(inserted);
 
-        pb_clone.set_position(files as u64);
-        pb_clone.set_message(format!(
-            "{} funcs, {} types | {} batches pending",
-            funcs, types, pending
-        ));
+            pb_clone.set_position(files as u64);
+            pb_clone.set_message(format!(
+                "{} funcs, {} types | {} batches pending",
+                funcs, types, pending
+            ));
 
-        if pb_clone.is_finished() {
-            break;
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(20) && files != last_files {
+                println!("progress: {files} files | {funcs} funcs | {types} types | {pending} batches pending");
+                last_files = files;
+            }
+
+            if pb_clone.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
     // Spawn single generator thread that walks the tree

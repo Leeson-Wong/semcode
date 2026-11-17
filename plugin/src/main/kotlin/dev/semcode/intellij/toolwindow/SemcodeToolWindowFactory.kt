@@ -70,6 +70,7 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             emptyText.setText("Indexing output appears here")
         }
         private val consoleTimer = javax.swing.Timer(500) { refreshConsole() }.apply { stop() }
+        private var indexStartMillis = 0L
         private val searchField = JBTextField().apply { emptyText.text = "Describe what you're looking for…" }
         private val searchButton = JButton("Search")
         private val modeBox = JComboBox(arrayOf("Semantic", "Regex"))
@@ -115,11 +116,13 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             copyPromptButton.addActionListener { copyAiPrompt() }
 
             // 索引可视化（用户 2026-11-16 要求面板内可见）：启动自动索引与
-            // 手动 Rebuild 共用 service 的日志流；跑动中 500ms 刷新一次尾部。
+            // 手动 Rebuild 共用 service 的日志流；跑动中 500ms 刷新一次尾部，
+            // 状态行带已用时间（用户 2026-11-17 要求计时）。
             service().addIndexListener { running ->
                 SwingUtilities.invokeLater {
                     if (running) {
-                        statusLabel.text = "Indexing…"
+                        indexStartMillis = System.currentTimeMillis()
+                        statusLabel.text = "Indexing… 0s"
                         consoleTimer.start()
                     } else {
                         consoleTimer.stop()
@@ -129,6 +132,7 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
                 }
             }
             if (service().indexRunning) {
+                indexStartMillis = System.currentTimeMillis()
                 consoleTimer.start()
             }
 
@@ -182,6 +186,14 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             if (consoleArea.text != tail) {
                 consoleArea.text = tail
                 consoleArea.caretPosition = consoleArea.text.length
+            }
+            if (service().indexRunning && indexStartMillis > 0) {
+                val secs = (System.currentTimeMillis() - indexStartMillis) / 1000
+                statusLabel.text = "Indexing… " + if (secs >= 60) {
+                    "${secs / 60}m${secs % 60}s"
+                } else {
+                    "${secs}s"
+                }
             }
         }
 
