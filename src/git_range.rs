@@ -773,6 +773,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     let max_generators = std::cmp::min(num_cpus::get(), 32);
     let num_generators = std::cmp::min(max_generators, commit_shas.len()).max(1);
 
+    let commit_shas_len = commit_shas.len();
     // Split commits into chunks for each generator
     let chunk_size = commit_shas.len().div_ceil(num_generators);
     let commit_chunks: Vec<Vec<String>> = commit_shas
@@ -823,6 +824,15 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     let sent_in_this_run = Arc::new(DashSet::new());
 
     // Spawn progress updater thread
+    // The range pipeline is the plugin's source step (HEAD^..HEAD), and a
+    // baseline commit whose diff is the whole tree makes it the longest
+    // phase of all — it went pipe-silent for exactly that span (2026-11-17,
+    // second field report). Banner plus a time-based line every ~2s, like
+    // the tree pipeline.
+    println!(
+        "phase: reading range {}, {} commits",
+        config.git_range, commit_shas_len
+    );
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
     let functions_clone = inserted_functions.clone();
@@ -830,6 +840,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
     let batches_sent_clone = batches_sent.clone();
     let batches_inserted_clone = batches_inserted.clone();
     let progress_thread = std::thread::spawn(move || {
+        let mut tick: u32 = 0;
         loop {
             let files = processed_clone.load(Ordering::Relaxed);
             let funcs = functions_clone.load(Ordering::Relaxed);
@@ -843,6 +854,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                 "{} funcs, {} types | {} batches pending",
                 funcs, types, pending
             ));
+
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(20) {
+                println!(
+                    "progress: {files} files | {funcs} funcs | {types} types | {pending} batches pending"
+                );
+            }
 
             // Check if we should exit
             if pb_clone.is_finished() {
