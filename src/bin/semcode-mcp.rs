@@ -5283,6 +5283,26 @@ error: {e}",
     }
 
     async fn handle_index_project(&self, args: &Value) -> Value {
+        // Workspace mode: this handler owns one database, but a workspace
+        // holds several — silently (re)indexing only the first is wrong work
+        // at full tilt (2026-11-17: a stray index_project burned ~15 cores
+        // for minutes). The IDE plugin indexes workspaces per repository.
+        if self.repos.len() > 1 {
+            let names: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+            return json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "index_project is disabled in workspace mode ({} repositories: {}). \
+                         Indexing runs per repository: `semcode-index -s <repo-dir>` on the command line, \
+                         or reopen the workspace in the IDE with the Semcode plugin.",
+                        names.len(),
+                        names.join(", ")
+                    )
+                }],
+                "isError": true
+            });
+        }
         let vectors = args["vectors"].as_bool().unwrap_or(true);
         let full = args["full"].as_bool().unwrap_or(false);
 

@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicLong
 class SemcodeMcpClient(
     private val command: List<String>,
     private val workDir: File,
+    private val env: Map<String, String> = emptyMap(),
 ) {
     private val log = Logger.getInstance(SemcodeMcpClient::class.java)
     private val gson = Gson()
@@ -41,6 +42,7 @@ class SemcodeMcpClient(
         val proc = try {
             ProcessBuilder(command)
                 .directory(workDir)
+                .apply { environment().putAll(env) }
                 .start()
         } catch (e: Exception) {
             log.warn("failed to start semcode-mcp: ${command.firstOrNull()}", e)

@@ -408,7 +408,12 @@ class SemcodeProcessService(private val project: Project) : Disposable {
                     "--lazy",
                 )
             }
-            client = SemcodeMcpClient(baseArgs + modelArgs, root)
+            client = SemcodeMcpClient(
+                baseArgs + modelArgs,
+                root,
+                // MCP 内的后台索引/index_project 工具同样受 worker 上限约束
+                mapOf("SEMCODE_WORKERS" to workerLimit().toString()),
+            )
         }
         return client
     }
