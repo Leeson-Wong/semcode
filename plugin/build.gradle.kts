@@ -10,7 +10,7 @@ plugins {
 group = "dev.semcode"
 // 版本策略：每次需要用户重装插件的构建都必须升版本号，让用户能在
 // Settings | Plugins 里看清装的是哪一版（用户 2026-11-14 明确要求）
-version = "0.9.9"
+version = "0.9.10"
 
 repositories {
     // 阿里云镜像优先（本机 init.d/mirror.gradle 只作用于 settings 层，

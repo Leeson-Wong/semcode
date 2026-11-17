@@ -2486,6 +2486,7 @@ impl VectorSearchManager {
                 total_contents += table.count_rows(None).await.unwrap_or(0) as usize;
             }
         }
+        println!("phase: vectorizing {total_contents} contents");
         let total_contents = Arc::new(AtomicUsize::new(total_contents));
         let last_progress_line = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
 

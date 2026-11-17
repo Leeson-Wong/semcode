@@ -1154,6 +1154,11 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
             .unwrap_or(0),
     ));
 
+    println!(
+        "phase: reading tree at {}, {} candidate files",
+        &config.commit_sha[..8.min(config.commit_sha.len())],
+        total_files.load(Ordering::Relaxed)
+    );
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();

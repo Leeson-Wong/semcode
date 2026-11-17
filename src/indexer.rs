@@ -644,6 +644,10 @@ pub async fn process_commits_pipeline(
     let processed_count = Arc::new(AtomicUsize::new(0));
     let inserted_count = Arc::new(AtomicUsize::new(0));
 
+    println!(
+        "phase: commit history walk, {} commits to parse",
+        commit_shas.len()
+    );
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
@@ -653,16 +657,17 @@ pub async fn process_commits_pipeline(
         // Pipe-visible line every ~2s (the spinner is invisible when stdout
         // is captured, and a 200-commit backfill parses diffs for ~ten
         // minutes — the plugin's elapsed clock only moves on new lines).
-        let mut last_processed = 0usize;
         let mut tick: u32 = 0;
         loop {
             let count = processed_clone.load(Ordering::Relaxed);
             let inserted = inserted_clone.load(Ordering::Relaxed);
             pb_clone.set_position(count as u64);
             tick = tick.wrapping_add(1);
-            if tick.is_multiple_of(20) && count != last_processed {
+            if tick.is_multiple_of(20) {
+                // Time-based: one baseline commit's diff can take minutes to
+                // parse; a change-based condition goes silent for exactly
+                // that span (2026-11-17 field report: 18 frozen minutes).
                 println!("progress: {count}/{total_commits} commits parsed, {inserted} stored");
-                last_processed = count;
             }
             if pb_clone.is_finished() {
                 break;
@@ -920,6 +925,10 @@ pub async fn process_lore_commits_pipeline(
     let processed_count = Arc::new(AtomicUsize::new(0));
     let inserted_count = Arc::new(AtomicUsize::new(0));
 
+    println!(
+        "phase: lore email walk, {} emails to parse",
+        commit_shas.len()
+    );
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
@@ -929,16 +938,17 @@ pub async fn process_lore_commits_pipeline(
         // Pipe-visible line every ~2s (the spinner is invisible when stdout
         // is captured, and a 200-commit backfill parses diffs for ~ten
         // minutes — the plugin's elapsed clock only moves on new lines).
-        let mut last_processed = 0usize;
         let mut tick: u32 = 0;
         loop {
             let count = processed_clone.load(Ordering::Relaxed);
             let inserted = inserted_clone.load(Ordering::Relaxed);
             pb_clone.set_position(count as u64);
             tick = tick.wrapping_add(1);
-            if tick.is_multiple_of(20) && count != last_processed {
+            if tick.is_multiple_of(20) {
+                // Time-based: one baseline commit's diff can take minutes to
+                // parse; a change-based condition goes silent for exactly
+                // that span (2026-11-17 field report: 18 frozen minutes).
                 println!("progress: {count}/{total_commits} commits parsed, {inserted} stored");
-                last_processed = count;
             }
             if pb_clone.is_finished() {
                 break;
