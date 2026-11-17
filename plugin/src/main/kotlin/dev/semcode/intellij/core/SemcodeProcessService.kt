@@ -128,6 +128,14 @@ class SemcodeProcessService(private val project: Project) : Disposable {
             onLine("ERROR: project has no base path")
             return false
         }
+        // semcode 按 git commit 索引，非 git 项目必然失败（2026-11-17 实测，
+        // 索引器的原始报错在通知里只剩 "step failed"）。在这里说明，而不是
+        // 让 exe 跑一遍再失败——Rebuild 按钮、菜单、自动索引都走这条链。
+        if (!File(root, ".git").exists()) {
+            onLine("ERROR: this project is not a git repository — semcode indexes by git commit.")
+            onLine("       Open a git project, or run 'git init' here first.")
+            return false
+        }
         val bins = resolveBinaries() ?: run {
             onLine("ERROR: semcode binaries not found — set them in Settings | Tools | Semcode")
             return false

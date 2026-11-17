@@ -220,9 +220,16 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
                         if (ok) {
                             notify("Indexing complete (${lines.size} output lines)")
                         } else {
+                            // 尾部多行而不是一行：索引器的真实报错常常不在最后一行
+                            val tail = lines.asReversed()
+                                .takeWhile { !it.startsWith(">>>") }
+                                .take(3)
+                                .asReversed()
+                                .joinToString(" | ")
+                                .ifBlank { "no output" }
+                                .take(300)
                             notify(
-                                "Indexing failed — last output: " +
-                                    (lines.lastOrNull { !it.startsWith(">>>") } ?: "none"),
+                                "Indexing failed — $tail",
                             )
                         }
                     }
