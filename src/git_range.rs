@@ -1134,6 +1134,26 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let failed_batches = Arc::new(AtomicUsize::new(0));
     let failed_files = Arc::new(AtomicUsize::new(0));
 
+    // Total candidate files, counted before streaming so the progress line
+    // can say N/TOTAL (2026-11-17: "7000 files, where am I" was unanswerable
+    // with a cumulative-only counter). One extra tree walk over cached
+    // objects; files that fail extension or scope do not count.
+    let total_files = Arc::new(std::sync::atomic::AtomicUsize::new(
+        gix::discover(&config.repo_path)
+            .ok()
+            .and_then(|repo| {
+                get_git_commit_manifest_with_repo(
+                    &repo,
+                    &config.commit_sha,
+                    &config.extensions,
+                    &config.scope_prefixes,
+                )
+                .ok()
+                .map(|m| m.len())
+            })
+            .unwrap_or(0),
+    ));
+
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
@@ -1141,6 +1161,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let types_clone = inserted_types.clone();
     let batches_sent_clone = batches_sent.clone();
     let batches_inserted_clone = batches_inserted.clone();
+    let total_files_clone = Arc::clone(&total_files);
     let progress_thread = std::thread::spawn(move || {
         // The indicatif spinner is invisible through a pipe (the plugin and
         // CI capture stdout), so the same numbers also go out as plain lines
@@ -1153,11 +1174,16 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
             let sent = batches_sent_clone.load(Ordering::Relaxed);
             let inserted = batches_inserted_clone.load(Ordering::Relaxed);
             let pending = sent.saturating_sub(inserted);
+            let total = total_files_clone.load(Ordering::Relaxed);
 
             pb_clone.set_position(files as u64);
+            let of_total = if total > 0 {
+                format!("{files}/{total}")
+            } else {
+                format!("{files}")
+            };
             pb_clone.set_message(format!(
-                "{} funcs, {} types | {} batches pending",
-                funcs, types, pending
+                "{of_total} files, {funcs} types | {pending} batches pending"
             ));
 
             tick = tick.wrapping_add(1);
@@ -1165,7 +1191,9 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                 // Time-based, not change-based: the tree walk before the
                 // first parse keeps files at 0 for minutes, and a silent
                 // line freezes the consumer's elapsed clock.
-                println!("progress: {files} files | {funcs} funcs | {types} types | {pending} batches pending");
+                println!(
+                    "progress: {of_total} files | {funcs} funcs | {types} types | {pending} batches pending"
+                );
             }
 
             if pb_clone.is_finished() {

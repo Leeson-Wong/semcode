@@ -1030,6 +1030,13 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
 
 fn main() -> Result<()> {
     semcode::lower_process_priority();
+    // model2vec's batch encode rides rayon's GLOBAL pool, which defaults to
+    // every core — the one pipeline worker_limit() could not reach (2026-11-17:
+    // the vectors step burned ~27 cores on a 32-thread machine).
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(semcode::worker_limit())
+        .build_global()
+        .ok();
     // #[tokio::main] starts one worker per CPU.  Cap it, but let
     // TOKIO_WORKER_THREADS override as it does for the default runtime.
     let mut runtime = tokio::runtime::Builder::new_multi_thread();

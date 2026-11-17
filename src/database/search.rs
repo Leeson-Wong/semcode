@@ -2472,6 +2472,23 @@ impl VectorSearchManager {
         let processed_count = Arc::new(AtomicUsize::new(0));
         let new_vectors_count = Arc::new(AtomicUsize::new(0));
 
+        // Total content rows across shards, so the progress line says N/M
+        // (2026-11-17: the vectors step was pipe-silent and read as a hang
+        // while burning every core). Counted once, cheaply.
+        let mut total_contents = 0usize;
+        for shard in 0..16u8 {
+            if let Ok(table) = self
+                .connection
+                .open_table(format!("content_{shard}"))
+                .execute()
+                .await
+            {
+                total_contents += table.count_rows(None).await.unwrap_or(0) as usize;
+            }
+        }
+        let total_contents = Arc::new(AtomicUsize::new(total_contents));
+        let last_progress_line = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+
         // Memory-bounded chunk size (process ~10k entries at a time in memory)
         let memory_chunk_size = 10000;
 
@@ -2488,6 +2505,8 @@ impl VectorSearchManager {
                 let processed_counter = Arc::clone(&processed_count);
                 let new_vectors_counter = Arc::clone(&new_vectors_count);
                 let existing_hashes = Arc::clone(&existing_content_hashes);
+                let total_contents_arc = Arc::clone(&total_contents);
+                let last_progress_line_arc = Arc::clone(&last_progress_line);
 
                 tokio::spawn(async move {
                     let table_name = format!("content_{shard}");
@@ -2591,6 +2610,20 @@ impl VectorSearchManager {
                             .fetch_add(entries_in_chunk, Ordering::Relaxed)
                             + entries_in_chunk;
                         pb.set_position(current as u64);
+
+                        // Pipe-visible line every ~2s: the spinner is not
+                        // rendered when stdout is captured (plugin, CI), and
+                        // a silent phase freezes the consumer's elapsed clock.
+                        {
+                            let mut last = last_progress_line_arc.lock().unwrap();
+                            if last.elapsed() >= std::time::Duration::from_secs(2) {
+                                *last = std::time::Instant::now();
+                                println!(
+                                    "progress: {current}/{} contents vectorized",
+                                    total_contents_arc.load(Ordering::Relaxed)
+                                );
+                            }
+                        }
 
                         offset += memory_chunk_size;
                     }
