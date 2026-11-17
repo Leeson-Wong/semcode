@@ -16,6 +16,9 @@ class SemcodeSettings : PersistentStateComponent<SemcodeSettings> {
     /** 存放 semcode-index.exe / semcode.exe / semcode-mcp.exe 的目录 */
     var binariesDir: String = ""
 
+    /** 索引工作线程数；0 = 自动（1/4 核数，2~8）。用户 2026-11-17 要求可控。 */
+    var workerThreads: Int = 0
+
     override fun getState(): SemcodeSettings = this
 
     override fun loadState(state: SemcodeSettings) {

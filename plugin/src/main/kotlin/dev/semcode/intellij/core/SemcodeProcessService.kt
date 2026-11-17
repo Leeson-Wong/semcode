@@ -408,22 +408,27 @@ class SemcodeProcessService(private val project: Project) : Disposable {
                     "--lazy",
                 )
             }
-            client = SemcodeMcpClient(
-                baseArgs + modelArgs,
-                root,
-                // MCP 内的后台索引/index_project 工具同样受 worker 上限约束
-                mapOf("SEMCODE_WORKERS" to workerLimit().toString()),
-            )
+            client = SemcodeMcpClient(baseArgs + modelArgs, root, childEnv())
         }
         return client
     }
 
     private var client: SemcodeMcpClient? = null
 
-    /** 索引资源上限（用户 2026-11-17 要求）：默认一半核数（≥2），
-     *  通过 SEMCODE_WORKERS 传给 Rust 端的 worker_limit()。 */
-    private fun workerLimit(): Int =
-        (Runtime.getRuntime().availableProcessors() / 2).coerceIn(2, 16)
+    /** 索引资源上限（用户 2026-11-17 两次反馈机器被吃满）：
+     *  默认 1/4 核数（≥2 封顶 8），Settings | Tools | Semcode 可覆盖；
+     *  通过 SEMCODE_WORKERS 传给 Rust 端 worker_limit()。核数之外，
+     *  子进程统一 BELOW_NORMAL 优先级——线程再多也抢不过前台应用。 */
+    internal fun workerLimit(): Int {
+        val custom = SemcodeSettings.getInstance().workerThreads
+        if (custom >= 1) return custom
+        return (Runtime.getRuntime().availableProcessors() / 4).coerceIn(2, 8)
+    }
+
+    internal fun childEnv(): Map<String, String> = mapOf(
+        "SEMCODE_WORKERS" to workerLimit().toString(),
+        "SEMCODE_LOW_PRIORITY" to "1",
+    )
 
     /** 当前索引子进程（取消/关项目时强杀，别留孤儿锁着 exe）。 */
     @Volatile
@@ -439,7 +444,7 @@ class SemcodeProcessService(private val project: Project) : Disposable {
             val process = ProcessBuilder(command)
                 .directory(workDir)
                 .redirectErrorStream(true)
-                .apply { environment()["SEMCODE_WORKERS"] = workerLimit().toString() }
+                .apply { environment().putAll(childEnv()) }
                 .start()
             currentProcess = process
             // 看门狗：进度条取消 / 项目关闭 → 强杀子进程。没有它，取消按钮

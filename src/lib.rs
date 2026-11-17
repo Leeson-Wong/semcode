@@ -30,8 +30,8 @@ pub mod pages;
 pub mod search;
 
 /// Worker threads for CPU-bound indexing pipelines. `SEMCODE_WORKERS` caps it
-/// (the plugin passes half the cores so a running index leaves the machine
-/// usable); unset or invalid = all cores.
+/// (the plugin passes a fraction of the cores so a running index leaves the
+/// machine usable); unset or invalid = all cores.
 pub fn worker_limit() -> usize {
     std::env::var("SEMCODE_WORKERS")
         .ok()
@@ -39,6 +39,27 @@ pub fn worker_limit() -> usize {
         .filter(|n| *n >= 1)
         .unwrap_or_else(num_cpus::get)
         .max(1)
+}
+
+/// Drop this process to below-normal priority when `SEMCODE_LOW_PRIORITY` is
+/// set (the plugin sets it for its children). Thread caps bound the worst
+/// case; the scheduler priority is what keeps the user's foreground apps
+/// responsive while the cap is in use. Child processes inherit the class.
+pub fn lower_process_priority() {
+    if std::env::var("SEMCODE_LOW_PRIORITY").as_deref() != Ok("1") {
+        return;
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
+        };
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    #[cfg(not(windows))]
+    {
+        //Unix: nice() via libc is left out for now; the plugin ships win-x64 first.
+    }
 }
 
 // Re-export the main types and structs

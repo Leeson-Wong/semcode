@@ -647,13 +647,28 @@ pub async fn process_commits_pipeline(
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
-    let progress_thread = std::thread::spawn(move || loop {
-        let count = processed_clone.load(Ordering::Relaxed);
-        pb_clone.set_position(count as u64);
-        if pb_clone.is_finished() {
-            break;
+    let inserted_clone = inserted_count.clone();
+    let total_commits = commit_shas.len();
+    let progress_thread = std::thread::spawn(move || {
+        // Pipe-visible line every ~2s (the spinner is invisible when stdout
+        // is captured, and a 200-commit backfill parses diffs for ~ten
+        // minutes — the plugin's elapsed clock only moves on new lines).
+        let mut last_processed = 0usize;
+        let mut tick: u32 = 0;
+        loop {
+            let count = processed_clone.load(Ordering::Relaxed);
+            let inserted = inserted_clone.load(Ordering::Relaxed);
+            pb_clone.set_position(count as u64);
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(20) && count != last_processed {
+                println!("progress: {count}/{total_commits} commits parsed, {inserted} stored");
+                last_processed = count;
+            }
+            if pb_clone.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
     // Spawn worker threads to extract commit metadata
@@ -908,13 +923,28 @@ pub async fn process_lore_commits_pipeline(
     // Spawn progress updater thread
     let pb_clone = pb.clone();
     let processed_clone = processed_count.clone();
-    let progress_thread = std::thread::spawn(move || loop {
-        let count = processed_clone.load(Ordering::Relaxed);
-        pb_clone.set_position(count as u64);
-        if pb_clone.is_finished() {
-            break;
+    let inserted_clone = inserted_count.clone();
+    let total_commits = commit_shas.len();
+    let progress_thread = std::thread::spawn(move || {
+        // Pipe-visible line every ~2s (the spinner is invisible when stdout
+        // is captured, and a 200-commit backfill parses diffs for ~ten
+        // minutes — the plugin's elapsed clock only moves on new lines).
+        let mut last_processed = 0usize;
+        let mut tick: u32 = 0;
+        loop {
+            let count = processed_clone.load(Ordering::Relaxed);
+            let inserted = inserted_clone.load(Ordering::Relaxed);
+            pb_clone.set_position(count as u64);
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(20) && count != last_processed {
+                println!("progress: {count}/{total_commits} commits parsed, {inserted} stored");
+                last_processed = count;
+            }
+            if pb_clone.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
     // Spawn worker threads to parse email metadata

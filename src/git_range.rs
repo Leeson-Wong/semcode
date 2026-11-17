@@ -1144,10 +1144,8 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
     let progress_thread = std::thread::spawn(move || {
         // The indicatif spinner is invisible through a pipe (the plugin and
         // CI capture stdout), so the same numbers also go out as plain lines
-        // every ~2s — but only when they moved, so a fully deduplicated
-        // incremental run stays silent.
+        // every ~2s.
         let mut tick: u32 = 0;
-        let mut last_files = 0usize;
         loop {
             let files = processed_clone.load(Ordering::Relaxed);
             let funcs = functions_clone.load(Ordering::Relaxed);
@@ -1163,9 +1161,11 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
             ));
 
             tick = tick.wrapping_add(1);
-            if tick.is_multiple_of(20) && files != last_files {
+            if tick.is_multiple_of(20) {
+                // Time-based, not change-based: the tree walk before the
+                // first parse keeps files at 0 for minutes, and a silent
+                // line freezes the consumer's elapsed clock.
                 println!("progress: {files} files | {funcs} funcs | {types} types | {pending} batches pending");
-                last_files = files;
             }
 
             if pb_clone.is_finished() {

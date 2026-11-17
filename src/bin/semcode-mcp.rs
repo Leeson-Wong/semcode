@@ -7563,6 +7563,7 @@ async fn run_stdio_server(server: Arc<McpServer>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    semcode::lower_process_priority();
     // Suppress ORT verbose logging
     std::env::set_var("ORT_LOG_LEVEL", "ERROR");
 

@@ -1029,6 +1029,7 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
 // ==================== End Branch Indexing Support ====================
 
 fn main() -> Result<()> {
+    semcode::lower_process_priority();
     // #[tokio::main] starts one worker per CPU.  Cap it, but let
     // TOKIO_WORKER_THREADS override as it does for the default runtime.
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
