@@ -243,7 +243,7 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         for ((i, repo) in repos.withIndex()) {
             val name = repo.name
             val db = File(dbRoot, name)
-            onLine(">>> [$i+1/${repos.size}] $name (source)")
+            onLine(">>> [${i + 1}/${repos.size}] $name (source)")
             if (!runProcess(
                     listOf(bins.index.absolutePath, "-s", ".", "-d", db.absolutePath),
                     repo,
@@ -252,7 +252,7 @@ class SemcodeProcessService(private val project: Project) : Disposable {
                 onLine("ERROR: source indexing failed for $name")
                 return false
             }
-            onLine(">>> [$i+1/${repos.size}] $name (vectors)")
+            onLine(">>> [${i + 1}/${repos.size}] $name (vectors)")
             if (!runProcess(
                     listOf(bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "--vectors") + modelArgs,
                     repo,
