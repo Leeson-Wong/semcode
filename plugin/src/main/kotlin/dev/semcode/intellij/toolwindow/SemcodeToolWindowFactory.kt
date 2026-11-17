@@ -27,9 +27,23 @@ import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
 
+/** 给 AI 编码会话的使用说明：一键拷贝后用户粘贴进 Claude Code 等。 */
+private val aiPrompt = """
+    这个项目已经配置了 semcode MCP（.mcp.json 由 Semcode 插件自动写入，无需手动注册），它提供 git 感知的语义代码检索、调用图和 git 历史考古。使用要点：
+
+    - 服务以 lazy 模式运行：先用 list_categories 看分类，get_tools 拿某类工具的 schema，再用 call_tool 执行
+    - code_lookup：find_function / find_type / find_callers / find_callchain —— 精确或模糊查符号与调用关系。调用图按名字解析，同名函数（C 尤其常见）请结合结果里的文件路径判断
+    - code_search：vgrep_functions 语义搜索（参数是 query_text，支持中文）/ grep_functions 正则搜索
+    - git_history：find_commit 可查任意已索引 commit。头部 "N of M indexed" 表示区间内只有 N 个提交已索引——回填历史用 index_project 的 full=true，不是错误
+    - status：indexing_status 查索引状态；index_project 触发索引（full=true 为全量，新装或刚支持新语言时用）
+    - 支持语言：C/C++、Rust、Python、Zig、Java、Kotlin、ArkTS（.ets）
+    - 预期行为（不是故障）：file_survey 在大索引上约 30 秒并附 "reference counts omitted" 注记；非内核项目 lore 工具返回"无 lore 数据"说明
+""".trimIndent()
+
 /**
- * Semcode 控制台：索引状态卡（状态 + 重建/刷新）+ 语义/正则双搜索 +
- * 结构化结果列表（双击跳转）+ 查询历史。查询走常驻 semcode-mcp 子进程。
+ * Semcode 控制台：索引状态卡（状态 + 重建/刷新/AI 提示词拷贝）+
+ * 语义/正则双搜索 + 结构化结果列表（双击跳转）+ 查询历史。
+ * 查询走常驻 semcode-mcp 子进程。
  */
 class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
 
@@ -91,11 +105,14 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             val statusButtons = JPanel()
             val rebuildButton = JButton("Rebuild Index")
             val refreshButton = JButton("Refresh")
+            val copyPromptButton = JButton("Copy AI Prompt")
             statusButtons.add(rebuildButton)
             statusButtons.add(refreshButton)
+            statusButtons.add(copyPromptButton)
             statusPanel.add(statusButtons, BorderLayout.EAST)
             rebuildButton.addActionListener { rebuildIndex() }
             refreshButton.addActionListener { refreshStatus() }
+            copyPromptButton.addActionListener { copyAiPrompt() }
 
             // 索引可视化（用户 2026-11-16 要求面板内可见）：启动自动索引与
             // 手动 Rebuild 共用 service 的日志流；跑动中 500ms 刷新一次尾部。
@@ -153,6 +170,12 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
         }
 
         private fun service(): SemcodeProcessService = SemcodeProcessService.getInstance(project)
+
+        private fun copyAiPrompt() {
+            com.intellij.openapi.ide.CopyPasteManager.getInstance()
+                .setContents(java.awt.datatransfer.StringSelection(aiPrompt))
+            notify("AI prompt copied — paste it into your AI coding session")
+        }
 
         private fun refreshConsole() {
             val tail = service().indexLog.toList().takeLast(80).joinToString("\n")
