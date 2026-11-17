@@ -2385,6 +2385,13 @@ struct Args {
     /// Enable lazy tool loading (reduces initial context by ~96%)
     #[arg(long, default_value = "false")]
     lazy: bool,
+
+    /// Workspace mode: the directory holds several git repositories; each is
+    /// indexed into <dir>/.idea/semcode.dbs/<repo>/ and queries fan out over
+    /// all of them. Mutually exclusive with -d/--git-repo in effect (they
+    /// describe the single-repo mode).
+    #[arg(long)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3261,6 +3268,28 @@ struct McpServer {
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
     notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
     lazy_mode: bool,
+    /// All repositories this server answers over; single-repo mode holds one
+    /// entry with an empty name, and every handler runs unchanged on it.
+    repos: Vec<WorkspaceRepo>,
+}
+
+/// One repository inside a workspace: its own index database and its own git
+/// history. Git-aware semantics only hold per repository, so a workspace is
+/// a fan-out over these, never a merge of their rows.
+struct WorkspaceRepo {
+    /// Directory name; "" for the single-repo mode (headers are suppressed).
+    name: String,
+    db: Arc<DatabaseManager>,
+    git_repo_path: String,
+    default_git_sha: Option<String>,
+}
+
+impl WorkspaceRepo {
+    fn head_sha(&self) -> String {
+        self.default_git_sha
+            .clone()
+            .unwrap_or_else(|| "0".repeat(40))
+    }
 }
 
 impl McpServer {
@@ -3290,6 +3319,13 @@ impl McpServer {
             }
         };
 
+        let repos = vec![WorkspaceRepo {
+            name: String::new(),
+            db: Arc::clone(&db),
+            git_repo_path: git_repo_path.to_string(),
+            default_git_sha: default_git_sha.clone(),
+        }];
+
         Ok(Self {
             db,
             default_git_sha,
@@ -3300,6 +3336,88 @@ impl McpServer {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode,
+            repos,
+        })
+    }
+
+    /// Workspace mode: scan up to three levels below `root` for git
+    /// repositories (a workspace like E:\C42 keeps them at depth three:
+    /// 0_raw/code/<repo>), each indexed into
+    /// `<root>/.idea/semcode.dbs/<repo-dir-name>/` — the plugin writes
+    /// there, the server looks there, no config to keep in sync.
+    async fn new_workspace(
+        root: &str,
+        model_path: Option<String>,
+        lazy_mode: bool,
+    ) -> Result<Self> {
+        fn scan(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = entry.file_name();
+                if p.join(".git").exists() {
+                    out.push(p);
+                } else if depth > 0
+                    && p.is_dir()
+                    && !matches!(
+                        name.to_str(),
+                        Some(".git" | ".idea" | "node_modules" | "build" | "target")
+                    )
+                {
+                    scan(&p, depth - 1, out);
+                }
+            }
+        }
+        let root_path = std::path::Path::new(root);
+        let mut repo_dirs: Vec<std::path::PathBuf> = Vec::new();
+        scan(root_path, 2, &mut repo_dirs);
+        repo_dirs.sort();
+
+        if repo_dirs.is_empty() {
+            anyhow::bail!(
+                "no git repositories found within two levels below {root} — \
+                 workspace mode needs at least one"
+            );
+        }
+
+        let db_root = root_path.join(".idea").join("semcode.dbs");
+        let mut repos = Vec::new();
+        for dir in &repo_dirs {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            // The indexer's -d treats a plain directory as a parent and
+            // writes <dir>/.semcode.db inside it — match that layout.
+            let db_path = db_root.join(&name).join(".semcode.db");
+            let git_path = dir.to_string_lossy().into_owned();
+            eprintln!("Workspace repo: {name} ({})", dir.display());
+            let db = Arc::new(
+                DatabaseManager::new(db_path.to_string_lossy().as_ref(), git_path.clone()).await?,
+            );
+            let default_git_sha = git::get_git_sha(&git_path).ok().flatten();
+            repos.push(WorkspaceRepo {
+                name,
+                db,
+                git_repo_path: git_path,
+                default_git_sha,
+            });
+        }
+
+        let first = &repos[0];
+        Ok(Self {
+            db: Arc::clone(&first.db),
+            default_git_sha: first.default_git_sha.clone(),
+            model_path,
+            git_repo_path: first.git_repo_path.clone(),
+            database_path: db_root.to_string_lossy().into_owned(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode,
+            repos,
         })
     }
 
@@ -3310,6 +3428,23 @@ impl McpServer {
             .map(|s| s.to_string())
             .or_else(|| self.default_git_sha.clone())
             .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string())
+    }
+
+    /// Per-repo SHA resolution for workspace fan-out: explicit sha, resolved
+    /// branch (against that repo), else that repo's HEAD.
+    fn repo_sha(
+        repo: &WorkspaceRepo,
+        git_sha_arg: Option<&str>,
+        branch_arg: Option<&str>,
+    ) -> String {
+        if let Some(branch) = branch_arg {
+            if let Ok(sha) = git::resolve_branch(&repo.git_repo_path, branch) {
+                return sha;
+            }
+        }
+        git_sha_arg
+            .map(str::to_string)
+            .unwrap_or_else(|| repo.head_sha())
     }
 
     /// Resolve git SHA from either git_sha or branch argument.
@@ -3702,6 +3837,45 @@ impl McpServer {
             });
         };
 
+        // Workspace mode: a "repoName/rel/path" prefix routes to that repo.
+        if self.repos.len() > 1 {
+            let mut routed: Option<(&WorkspaceRepo, &str)> = None;
+            for repo in &self.repos {
+                if let Some(stripped) = path.strip_prefix(&format!("{}/", repo.name)) {
+                    routed = Some((repo, stripped));
+                    break;
+                }
+            }
+            let (repo, rel) = match routed {
+                Some((repo, rel)) => (repo, rel),
+                None => {
+                    return json!({
+                        "error": format!(
+                            "workspace mode needs the path as <repo>/<file>, repos: {}",
+                            self.repos.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ),
+                        "isError": true
+                    })
+                }
+            };
+            let root = std::path::Path::new(&repo.git_repo_path);
+            let sha = repo.head_sha();
+            let result = semcode::file_survey::survey_file_json_with_references(
+                root,
+                std::path::Path::new(rel),
+                &repo.db,
+                &sha,
+            )
+            .await;
+            return match result {
+                Ok(output) => json!({ "content": [{ "type": "text", "text": output }] }),
+                Err(e) => json!({
+                    "error": format!("Failed to survey file: {e}"),
+                    "isError": true
+                }),
+            };
+        }
+
         let workspace = std::path::Path::new(&self.git_repo_path);
         let result = match semcode::git::get_git_sha(workspace) {
             Ok(Some(git_sha)) => {
@@ -3754,6 +3928,46 @@ impl McpServer {
     }
 
     async fn handle_find_function(&self, args: &Value) -> Value {
+        // Workspace fan-out: one answer per repository, headed by repo name.
+        if self.repos.len() > 1 {
+            let name = args["name"].as_str().unwrap_or("");
+            let mut text = String::new();
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                match mcp_query_function_or_macro(&repo.db, name, &git_sha).await {
+                    Ok(output) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+{}",
+                            repo.name, output
+                        ));
+                    }
+                    Err(e) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+error: {e}",
+                            repo.name
+                        ));
+                    }
+                }
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         // Check if database is empty and return helpful message
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
@@ -3781,6 +3995,45 @@ impl McpServer {
     }
 
     async fn handle_find_type(&self, args: &Value) -> Value {
+        if self.repos.len() > 1 {
+            let name = args["name"].as_str().unwrap_or("");
+            let mut text = String::new();
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                match mcp_query_type_or_typedef(&repo.db, name, &git_sha).await {
+                    Ok(output) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+{}",
+                            repo.name, output
+                        ));
+                    }
+                    Err(e) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+error: {e}",
+                            repo.name
+                        ));
+                    }
+                }
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         // Check if database is empty and return helpful message
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
@@ -3808,6 +4061,45 @@ impl McpServer {
     }
 
     async fn handle_find_callers(&self, args: &Value) -> Value {
+        if self.repos.len() > 1 {
+            let name = args["name"].as_str().unwrap_or("");
+            let mut text = String::new();
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                match mcp_show_callers(&repo.db, name, &git_sha, Context::Any).await {
+                    Ok(output) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+{}",
+                            repo.name, output
+                        ));
+                    }
+                    Err(e) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+error: {e}",
+                            repo.name
+                        ));
+                    }
+                }
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         // Check if database is empty and return helpful message
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
@@ -4025,6 +4317,57 @@ impl McpServer {
     }
 
     async fn handle_grep_functions(&self, args: &Value) -> Value {
+        if self.repos.len() > 1 {
+            let pattern = args["pattern"].as_str().unwrap_or("");
+            let path_pattern = args["path_pattern"].as_str();
+            let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+            let mut text = String::new();
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                match mcp_grep_function_bodies(
+                    &repo.db,
+                    pattern,
+                    false,
+                    path_pattern,
+                    limit,
+                    &git_sha,
+                )
+                .await
+                {
+                    Ok(output) if !output.trim().is_empty() => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+{}",
+                            repo.name, output
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+error: {e}",
+                            repo.name
+                        ));
+                    }
+                }
+            }
+            return json!({ "content": [{ "type": "text", "text": truncate_output(text) }] });
+        }
         // Check if database is empty and return helpful message
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
@@ -4071,6 +4414,69 @@ impl McpServer {
     }
 
     async fn handle_vgrep_functions(&self, args: &Value) -> Value {
+        // Workspace fan-out for the text format: same model on every db, so
+        // similarity scores are comparable; concatenated per repo.
+        if self.repos.len() > 1 && args["format"].as_str() != Some("json") {
+            let query_text = args["query_text"].as_str().unwrap_or("");
+            let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+            let mut text = String::new();
+            for repo in &self.repos {
+                match vgrep_json_results(&repo.db, query_text, limit, None, &self.model_path).await
+                {
+                    Ok(v) => {
+                        let results = v["results"].as_array().cloned().unwrap_or_default();
+                        if results.is_empty() {
+                            continue;
+                        }
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+",
+                            repo.name
+                        ));
+                        for (i, r) in results.iter().enumerate() {
+                            text.push_str(&format!(
+                                "{}. {}  {}%
+   {}:{}
+",
+                                i + 1,
+                                r["name"].as_str().unwrap_or("?"),
+                                r["similarity"]
+                                    .as_f64()
+                                    .map(|s| format!("{:.1}", s * 100.0))
+                                    .unwrap_or_default(),
+                                r["file_path"].as_str().unwrap_or("?"),
+                                r["line_start"].as_u64().unwrap_or(0),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+error: {e}",
+                            repo.name
+                        ));
+                    }
+                }
+            }
+            if text.is_empty() {
+                text = "No similar functions found in any repository.".into();
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         // Check if database is empty and return helpful message
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
@@ -4766,6 +5172,34 @@ impl McpServer {
     }
 
     async fn handle_indexing_status(&self) -> Value {
+        if self.repos.len() > 1 {
+            let mut text = format!(
+                "Workspace: {} repositories
+",
+                self.repos.len()
+            );
+            for repo in &self.repos {
+                let functions = repo.db.count_functions().await.unwrap_or(0);
+                let commits = repo
+                    .db
+                    .get_all_git_commits()
+                    .await
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                text.push_str(&format!(
+                    "  {} — {} functions, {} commits, HEAD {}
+",
+                    repo.name,
+                    functions,
+                    commits,
+                    repo.default_git_sha
+                        .as_deref()
+                        .map(|s| &s[..8.min(s.len())])
+                        .unwrap_or("?")
+                ));
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         let state = self.indexing_state.lock().await;
 
         let status_text = match &state.status {
@@ -7150,9 +7584,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Create MCP server
-    let server =
-        Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path, args.lazy).await?);
+    // Create MCP server: workspace mode opens every repository under the
+    // workspace root; single-repo mode is the -d/--git-repo pair.
+    let server = Arc::new(match args.workspace.as_deref() {
+        Some(root) => McpServer::new_workspace(root, args.model_path, args.lazy).await?,
+        None => McpServer::new(&database_path, &args.git_repo, args.model_path, args.lazy).await?,
+    });
 
     // Spawn background task to index current commit if needed
     eprintln!("[Background] Spawning background indexing task");
@@ -7394,7 +7831,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7403,6 +7840,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server.handle_indexing_status().await;
@@ -7430,7 +7873,7 @@ mod tests {
         };
 
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7439,6 +7882,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server.handle_indexing_status().await;
@@ -7468,7 +7917,7 @@ mod tests {
         };
 
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7477,6 +7926,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server.handle_indexing_status().await;
@@ -7510,6 +7965,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         // A fresh index is current, so nothing is refused.
@@ -7582,7 +8043,7 @@ mod tests {
         };
 
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7591,6 +8052,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server.handle_indexing_status().await;
@@ -7694,7 +8161,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7703,6 +8170,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: true,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server.handle_list_categories().await;
@@ -7725,7 +8198,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7734,6 +8207,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: true,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server
@@ -7758,7 +8237,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7767,6 +8246,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: true,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server
@@ -7787,7 +8272,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7796,6 +8281,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: true,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server
@@ -7816,7 +8307,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7825,6 +8316,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: true,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         // Try to call meta-tools via call_tool
@@ -7859,7 +8356,7 @@ mod tests {
             .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7868,6 +8365,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server
@@ -7889,7 +8392,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7898,6 +8401,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: true, // Enable lazy mode
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server.handle_list_tools().await;
@@ -7921,7 +8430,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7930,6 +8439,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false, // Disable lazy mode
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db,
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let result = server.handle_list_tools().await;
@@ -7948,7 +8463,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7957,6 +8472,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: true,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let init = server.handle_initialize(&json!({})).await;
@@ -7975,7 +8496,7 @@ mod tests {
                 .unwrap(),
         );
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -7984,6 +8505,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db: Arc::clone(&db),
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let init = server.handle_initialize(&json!({})).await;
