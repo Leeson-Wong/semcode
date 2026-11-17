@@ -131,9 +131,20 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         // semcode 按 git commit 索引，非 git 项目必然失败（2026-11-17 实测，
         // 索引器的原始报错在通知里只剩 "step failed"）。在这里说明，而不是
         // 让 exe 跑一遍再失败——Rebuild 按钮、菜单、自动索引都走这条链。
+        // 常见情形：把装着多个仓库的工作区文件夹当项目打开（如 E:\C42），
+        // 列出里面的仓库指路；在外层 git init 只会得到看不见嵌套仓库的空壳。
         if (!File(root, ".git").exists()) {
             onLine("ERROR: this project is not a git repository — semcode indexes by git commit.")
-            onLine("       Open a git project, or run 'git init' here first.")
+            val nested = root.listFiles()
+                ?.filter { it.isDirectory && File(it, ".git").exists() }
+                ?.take(5)
+                .orEmpty()
+            if (nested.isNotEmpty()) {
+                onLine("       This folder contains git repositories — open one of them as the project:")
+                nested.forEach { onLine("         ${it.absolutePath}") }
+            } else {
+                onLine("       Open a git project, or run 'git init' here first.")
+            }
             return false
         }
         val bins = resolveBinaries() ?: run {
