@@ -10,6 +10,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import dev.semcode.intellij.core.SemcodeAgentConfig
 import dev.semcode.intellij.core.SemcodeProcessService
+import java.io.File
 
 /**
  * 打开项目即就绪（用户 2026-11-16 拍板默认自动索引，面板有可视化）：
@@ -21,6 +22,19 @@ class SemcodeStartupActivity : ProjectActivity {
     override suspend fun execute(project: Project) {
         val service = SemcodeProcessService.getInstance(project)
         if (service.resolveBinaries() == null) {
+            return
+        }
+        // semcode 按 git commit 索引，非 git 项目打开必然失败（2026-11-17
+        // 实测：在 IDEA 的非 git 项目里自动索引报 "Not in a git repository"）。
+        // 直接说明并跳过，别让每次打开都失败一次。
+        val root = service.projectRoot()
+        if (root == null || !File(root, ".git").exists()) {
+            notify(
+                project,
+                "Semcode needs a git repository to index (this project has none). " +
+                    "Run 'git init' if you want semantic indexing here.",
+                NotificationType.WARNING,
+            )
             return
         }
         if (service.databaseDir().isDirectory && service.databaseDir().resolve("_versions").isDirectory) {
@@ -50,10 +64,10 @@ class SemcodeStartupActivity : ProjectActivity {
         }
     }
 
-    private fun notify(project: Project, message: String) {
+    private fun notify(project: Project, message: String, type: NotificationType = NotificationType.INFORMATION) {
         NotificationGroupManager.getInstance()
             .getNotificationGroup("Semcode")
-            .createNotification("Semcode", message, NotificationType.INFORMATION)
+            .createNotification("Semcode", message, type)
             .notify(project)
     }
 }
