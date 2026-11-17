@@ -1470,6 +1470,7 @@ pub async fn process_git_tree(
     println!("Types indexed: {}", stats.types_count);
 
     // Check if optimization is needed
+    println!("phase: checking database optimization health");
     match db_manager.check_optimization_health().await {
         Ok((needs_optimization, message)) => {
             if needs_optimization {
@@ -1699,6 +1700,7 @@ pub async fn process_git_range(
     info!("Types indexed: {}", stats.types_count);
 
     // Check if optimization is needed after git range indexing
+    println!("phase: checking database optimization health");
     match db_manager.check_optimization_health().await {
         Ok((needs_optimization, message)) => {
             if needs_optimization {
