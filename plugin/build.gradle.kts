@@ -1,3 +1,6 @@
+import java.nio.file.Paths
+import java.util.Properties
+
 plugins {
     id("java")
     kotlin("jvm") version "2.1.0"
@@ -18,13 +21,39 @@ repositories {
     intellijPlatform { defaultRepositories() }
 }
 
+// DevEco 本地平台路径（编译目标即部署目标，fork 系 IDE 插件开发的正确姿势）。
+// 两台机器安装路径不同，不能写死在仓库里（曾经每台机器 pull 后互相覆盖），
+// 按以下顺序解析，命中即用 local() 零下载：
+//   1. plugin/local.properties 的 deveco.home=...（gitignored，每台机器自维护）
+//   2. 环境变量 DEVECO_HOME
+//   3. Gradle property：-Pdeveco.home=... 或 ~/.gradle/gradle.properties
+// 都没有则回退到远程下载 IntelliJ IC 243（E:/devtools 那台没有的备选，
+// 首次下载较慢，之后有缓存），保证任何机器与 CI 零配置可构建。
+val devecoHome: String? = run {
+    val localProps = Properties()
+    val propsFile = layout.projectDirectory.file("local.properties").asFile
+    if (propsFile.isFile) localProps.load(propsFile.inputStream())
+    localProps.getProperty("deveco.home")
+        ?: System.getenv("DEVECO_HOME")
+        ?: providers.gradleProperty("deveco.home").orNull
+}
+val devecoDir = devecoHome?.let { Paths.get(it) }
+if (devecoDir != null && devecoDir.toFile().isDirectory) {
+    logger.lifecycle("semcode plugin: using local DevEco platform at $devecoDir")
+} else if (devecoDir != null) {
+    logger.warn("semcode plugin: deveco.home=$devecoDir does not exist, falling back to downloading IntelliJ IC 243")
+} else {
+    logger.lifecycle("semcode plugin: no local DevEco configured (local.properties / DEVECO_HOME), downloading IntelliJ IC 243")
+}
+
 dependencies {
     intellijPlatform {
-        // 用本机 DevEco Studio（基线 243.24978 = 2024.3 系）作本地平台：零下载，
-        // 且编译目标即部署目标（fork 系 IDE 插件开发的正确姿势）。
-        // 本机 IDEA/CLion 为 2026.3（263），对 243 目标太新，不用。
-        // 备选：intellijIdeaCommunity("243.21565.14") { useInstaller = false } + jetbrainsRuntime()
-        local("E:/devtools/DevEco Studio")
+        if (devecoDir != null && devecoDir.toFile().isDirectory) {
+            local(devecoDir.toString())
+        } else {
+            // 备选路线：与 DevEco 26.0 同基线（243 = 2024.3 系）的社区版
+            intellijIdeaCommunity("243.21565.14") { useInstaller = false }
+        }
     }
 }
 

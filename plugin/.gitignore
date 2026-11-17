@@ -4,3 +4,5 @@ build/
 *.iml
 .intellijPlatform/
 kotlin-js-store/
+# 每台机器自己的 DevEco 路径（deveco.home=E:/devtools/DevEco Studio），见 build.gradle.kts
+local.properties
