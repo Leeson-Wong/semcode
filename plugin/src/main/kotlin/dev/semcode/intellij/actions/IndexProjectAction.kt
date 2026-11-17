@@ -29,11 +29,13 @@ class IndexProjectAction : AnAction(), DumbAware {
                 val service = SemcodeProcessService.getInstance(project)
                 val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
 
+                val start = System.currentTimeMillis()
                 val ok = service.runIndexChain(
                     { line ->
                         lines.add(line)
-                        // 进度文本滚动显示最近一行输出
-                        indicator.text = line.take(120)
+                        // 进度文本滚动显示最近一行输出（带已用时前缀）
+                        val el = (System.currentTimeMillis() - start) / 1000
+                        indicator.text = "[${if (el >= 60) "${el / 60}m${el % 60}s" else "${el}s"}] ${line.take(100)}"
                     },
                     cancelled = { indicator.isCanceled },
                 )

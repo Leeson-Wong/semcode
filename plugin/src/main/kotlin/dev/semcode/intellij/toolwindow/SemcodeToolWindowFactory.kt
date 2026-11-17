@@ -236,10 +236,12 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Semcode indexing", true) {
                 override fun run(indicator: ProgressIndicator) {
                     indicator.isIndeterminate = true
+                    val start = System.currentTimeMillis()
                     val ok = service().runIndexChain(
                         { line ->
                             lines.add(line)
-                            indicator.text = line.take(120)
+                            val el = (System.currentTimeMillis() - start) / 1000
+                            indicator.text = "[${if (el >= 60) "${el / 60}m${el % 60}s" else "${el}s"}] ${line.take(100)}"
                         },
                         cancelled = { indicator.isCanceled },
                     )
