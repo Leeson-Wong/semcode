@@ -123,10 +123,56 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         }
     }
 
+    /**
+     * 工作区检测（0.9.0）：项目根本身不是 git 仓库但其下（最多三层，
+     * 与 semcode-mcp --workspace 的扫描规则一致：跳过 .git/.idea/
+     * node_modules/build/target）有 git 仓库 → 按工作区模式逐仓索引，
+     * MCP 以 --workspace 启动。单仓项目返回空表。
+     */
+    @Volatile
+    private var cachedWorkspaceRepos: List<File>? = null
+
+    fun workspaceRepos(): List<File> {
+        cachedWorkspaceRepos?.let { return it }
+        val root = projectRoot() ?: return emptyList<File>().also { cachedWorkspaceRepos = it }
+        if (File(root, ".git").exists()) {
+            cachedWorkspaceRepos = emptyList()
+            return cachedWorkspaceRepos!!
+        }
+        val out = mutableListOf<File>()
+        fun scan(dir: File, depth: Int) {
+            val entries = dir.listFiles() ?: return
+            for (e in entries) {
+                if (File(e, ".git").exists()) {
+                    out.add(e)
+                } else if (depth > 0 && e.isDirectory &&
+                    e.name !in setOf(".git", ".idea", "node_modules", "build", "target")
+                ) {
+                    scan(e, depth - 1)
+                }
+            }
+        }
+        scan(root, 2)
+        out.sortBy { it.name }
+        cachedWorkspaceRepos = out
+        return out
+    }
+
+    /** 工作区各仓的库根：<project>/.idea/semcode.dbs/（每仓一目录，内含 .semcode.db）。 */
+    fun workspaceDbRoot(): File? =
+        projectRoot()?.let { File(it, ".idea/semcode.dbs") }
+
     private fun runIndexChainInner(onLine: (String) -> Unit): Boolean {
         val root = projectRoot() ?: run {
             onLine("ERROR: project has no base path")
             return false
+        }
+        // 工作区模式：根不是 git 但其下有仓库（如 E:\C42）→ 逐仓索引，
+        // 库放 .idea/semcode.dbs/<repo>/，与 semcode-mcp --workspace 的
+        // 约定一致。
+        val repos = workspaceRepos()
+        if (repos.isNotEmpty()) {
+            return runWorkspaceIndex(repos, onLine)
         }
         // semcode 按 git commit 索引，非 git 项目必然失败（2026-11-17 实测，
         // 索引器的原始报错在通知里只剩 "step failed"）。在这里说明，而不是
@@ -182,6 +228,45 @@ class SemcodeProcessService(private val project: Project) : Disposable {
     }
 
     /**
+     * 工作区索引：逐仓跑两步链，库在 .idea/semcode.dbs/<repo>/（CLI 会
+     * 在其内写 .semcode.db，与 semcode-mcp --workspace 的读取约定一致）。
+     * 一个仓库失败即停——半途继续会让 status 里留着静默缺失的仓库。
+     */
+    private fun runWorkspaceIndex(repos: List<File>, onLine: (String) -> Unit): Boolean {
+        val bins = resolveBinaries() ?: run {
+            onLine("ERROR: semcode binaries not found — set them in Settings | Tools | Semcode")
+            return false
+        }
+        val dbRoot = workspaceDbRoot() ?: return false
+        val modelArgs = bundledModelDir()?.let { listOf("--model-path", it.absolutePath) } ?: emptyList()
+        onLine("Workspace: ${repos.size} repositories")
+        for ((i, repo) in repos.withIndex()) {
+            val name = repo.name
+            val db = File(dbRoot, name)
+            onLine(">>> [$i+1/${repos.size}] $name (source)")
+            if (!runProcess(
+                    listOf(bins.index.absolutePath, "-s", ".", "-d", db.absolutePath),
+                    repo,
+                ) { line -> onLine(line); indexLog.add(line.take(500)) }
+            ) {
+                onLine("ERROR: source indexing failed for $name")
+                return false
+            }
+            onLine(">>> [$i+1/${repos.size}] $name (vectors)")
+            if (!runProcess(
+                    listOf(bins.index.absolutePath, "-s", ".", "-d", db.absolutePath, "--vectors") + modelArgs,
+                    repo,
+                ) { line -> onLine(line); indexLog.add(line.take(500)) }
+            ) {
+                onLine("ERROR: vector step failed for $name")
+                return false
+            }
+            writeModelMarker(File(db, "model.sha"))
+        }
+        return true
+    }
+
+    /**
      * 换模型后的向量自愈（0.7.0）：捆绑模型的指纹与上次成功跑向量时记录的
      * 不一致 → 只重跑向量步骤（Rust 端 ensure_vectors_model 会清掉旧空间的
      * 向量重算）。指纹算法与 Rust 端一致：sha256(model.safetensors) 前 16 hex。
@@ -228,6 +313,12 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         modelMarkerFile()?.writeText(fp)
     }
 
+    private fun writeModelMarker(file: File) {
+        val fp = bundledModelFingerprint() ?: return
+        file.parentFile?.mkdirs()
+        file.writeText(fp)
+    }
+
     private fun sha256Prefix(file: File): String? = try {
         val md = java.security.MessageDigest.getInstance("SHA-256")
         file.inputStream().use { ins ->
@@ -249,17 +340,20 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         val root = projectRoot() ?: return null
         val bins = resolveBinaries() ?: return null
         if (client == null) {
-            val db = databaseDir()
             val modelArgs = bundledModelDir()?.let { listOf("--model-path", it.absolutePath) } ?: emptyList()
-            client = SemcodeMcpClient(
+            // 工作区项目（根下多个 git 仓库）用 --workspace 一进程管全部；
+            // 单仓项目维持 -d/--git-repo。
+            val baseArgs = if (workspaceRepos().isNotEmpty()) {
+                listOf(bins.mcp.absolutePath, "--workspace", root.absolutePath, "--lazy")
+            } else {
                 listOf(
                     bins.mcp.absolutePath,
-                    "-d", db.absolutePath,
+                    "-d", databaseDir().absolutePath,
                     "--git-repo", root.absolutePath,
                     "--lazy",
-                ) + modelArgs,
-                root,
-            )
+                )
+            }
+            client = SemcodeMcpClient(baseArgs + modelArgs, root)
         }
         return client
     }

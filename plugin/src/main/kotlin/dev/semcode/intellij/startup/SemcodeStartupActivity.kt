@@ -24,6 +24,29 @@ class SemcodeStartupActivity : ProjectActivity {
         if (service.resolveBinaries() == null) {
             return
         }
+        // 工作区项目（0.9.0）：根下有多个 git 仓库 → 逐仓索引 + --workspace
+        // 接线，走同一条 runIndexChain（内部按 workspaceRepos 分派）。
+        if (service.workspaceRepos().isNotEmpty()) {
+            val dbRoot = service.workspaceDbRoot()
+            val anyIndexed = dbRoot?.isDirectory == true &&
+                dbRoot.listFiles().orEmpty().any { it.resolve(".semcode.db/_versions").isDirectory }
+            if (anyIndexed) {
+                SemcodeAgentConfig.ensure(project, service)
+            } else {
+                ApplicationManager.getApplication().invokeLater {
+                    ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Semcode workspace indexing", true) {
+                        override fun run(indicator: ProgressIndicator) {
+                            indicator.isIndeterminate = true
+                            val ok = service.runIndexChain { line -> indicator.text = line.take(120) }
+                            if (ok) {
+                                notify(project, "Semcode workspace index ready — search in the Semcode tool window; Claude Code entry written to .mcp.json")
+                            }
+                        }
+                    })
+                }
+            }
+            return
+        }
         // semcode 按 git commit 索引，非 git 项目打开必然失败（2026-11-17
         // 实测：在 IDEA 的非 git 项目里自动索引报 "Not in a git repository"）。
         // 直接说明并跳过，别让每次打开都失败一次。

@@ -23,17 +23,17 @@ object SemcodeAgentConfig {
     fun ensure(project: Project, service: SemcodeProcessService): Boolean {
         val root = project.basePath ?: return false
         val bins = service.resolveBinaries() ?: return false
-        val db = service.databaseDir()
+        // 工作区项目写 --workspace（一个 server 管全部仓库）；单仓写 -d/--git-repo。
+        val args = if (service.workspaceRepos().isNotEmpty()) {
+            listOf("--workspace", root)
+        } else {
+            listOf("-d", service.databaseDir().absolutePath, "--git-repo", root)
+        }
         val entry = JsonObject().apply {
             addProperty("command", bins.mcp.absolutePath)
             add(
                 "args",
-                com.google.gson.JsonArray().apply {
-                    add("-d")
-                    add(db.absolutePath)
-                    add("--git-repo")
-                    add(root)
-                },
+                com.google.gson.JsonArray().apply { args.forEach { add(it) } },
             )
             add("env", JsonObject())
         }
