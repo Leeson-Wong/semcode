@@ -27,18 +27,29 @@ import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
 
-/** 给 AI 编码会话的使用说明：一键拷贝后用户粘贴进 Claude Code 等。 */
-private val aiPrompt = """
-    这个项目已经配置了 semcode MCP（.mcp.json 由 Semcode 插件自动写入，无需手动注册），它提供 git 感知的语义代码检索、调用图和 git 历史考古。使用要点：
+/** 给 AI 编码会话的引导提示：一键拷贝后用户粘贴进 Claude Code 等。 */
+private fun bootstrapPrompt(isWorkspace: Boolean, repoCount: Int): String = buildString {
+    append(
+        """
+        这个项目已经配置了 semcode MCP（.mcp.json 由 Semcode 插件自动写入，无需手动注册），它提供 git 感知的语义代码检索、调用图和 git 历史考古。使用要点：
 
-    - 服务以 lazy 模式运行：先用 list_categories 看分类，get_tools 拿某类工具的 schema，再用 call_tool 执行
-    - code_lookup：find_function / find_type / find_callers / find_callchain —— 精确或模糊查符号与调用关系。调用图按名字解析，同名函数（C 尤其常见）请结合结果里的文件路径判断
-    - code_search：vgrep_functions 语义搜索（参数是 query_text，支持中文）/ grep_functions 正则搜索
-    - git_history：find_commit 可查任意已索引 commit。头部 "N of M indexed" 表示区间内只有 N 个提交已索引——回填历史用 index_project 的 full=true，不是错误
-    - status：indexing_status 查索引状态；index_project 触发索引（full=true 为全量，新装或刚支持新语言时用）
-    - 支持语言：C/C++、Rust、Python、Zig、Java、Kotlin、ArkTS（.ets）
-    - 预期行为（不是故障）：file_survey 在大索引上约 30 秒并附 "reference counts omitted" 注记；非内核项目 lore 工具返回"无 lore 数据"说明
-""".trimIndent()
+        - 服务以 lazy 模式运行：先用 list_categories 看分类，get_tools 拿某类工具的 schema，再用 call_tool 执行
+        - code_lookup：find_function / find_type / find_callers / find_callchain —— 精确或模糊查符号与调用关系。调用图按名字解析，同名函数（C 尤其常见）请结合结果里的文件路径判断
+        - code_search：vgrep_functions 语义搜索（参数是 query_text，支持中文）/ grep_functions 正则搜索
+        - git_history：find_commit 可查任意已索引 commit。头部 "N of M indexed" 表示区间内只有 N 个提交已索引——回填历史用 index_project 的 full=true，不是错误
+        - status：indexing_status 查索引状态；index_project 触发索引（full=true 为全量，新装或刚支持新语言时用）
+        - 支持语言：C/C++、Rust、Python、Zig、Java、Kotlin、ArkTS（.ets）
+        - 预期行为（不是故障）：file_survey 在大索引上约 30 秒并附 "reference counts omitted" 注记；非内核项目 lore 工具返回"无 lore 数据"说明
+        """.trimIndent()
+    )
+    if (isWorkspace) {
+        append(
+            """
+
+        - 工作区模式（本项目是）：这个工作区含 $repoCount 个 git 仓库，一个 server 统一应答——查询自动扇出到全部仓库，结果带 "== repo: 仓库名 ==" 分节头；file_survey 的 path 参数要写 "<仓库名>/<仓库内相对路径>"；找不到的符号会在其它仓库如实报 not found，属正常""".trimIndent()
+        )
+    }
+}
 
 /**
  * Semcode 控制台：索引状态卡（状态 + 重建/刷新/AI 提示词拷贝）+
@@ -106,7 +117,7 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
             val statusButtons = JPanel()
             val rebuildButton = JButton("Rebuild Index")
             val refreshButton = JButton("Refresh")
-            val copyPromptButton = JButton("Copy AI Prompt")
+            val copyPromptButton = JButton("Copy Bootstrap Prompt")
             statusButtons.add(rebuildButton)
             statusButtons.add(refreshButton)
             statusButtons.add(copyPromptButton)
@@ -176,9 +187,11 @@ class SemcodeToolWindowFactory : ToolWindowFactory, DumbAware {
         private fun service(): SemcodeProcessService = SemcodeProcessService.getInstance(project)
 
         private fun copyAiPrompt() {
+            val repos = service().workspaceRepos()
+            val prompt = bootstrapPrompt(isWorkspace = repos.isNotEmpty(), repoCount = repos.size)
             com.intellij.openapi.ide.CopyPasteManager.getInstance()
-                .setContents(java.awt.datatransfer.StringSelection(aiPrompt))
-            notify("AI prompt copied — paste it into your AI coding session")
+                .setContents(java.awt.datatransfer.StringSelection(prompt))
+            notify("Bootstrap prompt copied — paste it into your AI coding session")
         }
 
         private fun refreshConsole() {
