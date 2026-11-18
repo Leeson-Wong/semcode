@@ -4131,6 +4131,57 @@ error: {e}",
     }
 
     async fn handle_find_implementors(&self, args: &Value) -> Value {
+        // Workspace fan-out (B1 acceptance: equivalent to single-repo mode —
+        // a slot in stargate cannot be found through edssdk's database).
+        if self.repos.len() > 1 {
+            let container_type = args["container_type"].as_str().unwrap_or("");
+            let container_type = container_type
+                .strip_prefix("struct ")
+                .unwrap_or(container_type);
+            let member = args["member"].as_str().unwrap_or("");
+            let mut text = String::new();
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                let found = repo
+                    .db
+                    .find_registrations_for_slot_git_aware(container_type, member, &git_sha)
+                    .await
+                    .unwrap_or_default();
+                if found.is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push_str(
+                        "
+
+",
+                    );
+                }
+                text.push_str(&format!(
+                    "== repo: {} ==
+Functions installed in {container_type}::{member}
+",
+                    repo.name
+                ));
+                for (i, registration) in found.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {} ({}:{})
+",
+                        i + 1,
+                        registration.target,
+                        registration.file_path,
+                        registration.line
+                    ));
+                }
+            }
+            if text.is_empty() {
+                text = format!(
+                    "Info: nothing is installed in {container_type}::{member} in any repository"
+                );
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
         }
@@ -4178,6 +4229,52 @@ error: {e}",
     }
 
     async fn handle_find_registrations(&self, args: &Value) -> Value {
+        // Workspace fan-out (B1): registrations live per repository.
+        if self.repos.len() > 1 {
+            let name = args["name"].as_str().unwrap_or("");
+            let mut text = format!(
+                "Where {name} is installed
+"
+            );
+            let mut any = false;
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                let found = repo
+                    .db
+                    .find_registrations_of_git_aware(name, &git_sha)
+                    .await
+                    .unwrap_or_default();
+                if found.is_empty() {
+                    continue;
+                }
+                any = true;
+                text.push_str(&format!(
+                    "== repo: {} ==
+",
+                    repo.name
+                ));
+                for (i, registration) in found.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {}::{} at {}:{} [{}]
+",
+                        i + 1,
+                        registration.container_type,
+                        registration.member,
+                        registration.file_path,
+                        registration.line,
+                        registration.kind.as_str()
+                    ));
+                }
+            }
+            if !any {
+                text.push_str(
+                    "Info: it is not installed in any struct member in any repository
+",
+                );
+            }
+            return json!({ "content": [{ "type": "text", "text": truncate_output(text) }] });
+        }
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
         }
@@ -4222,6 +4319,46 @@ error: {e}",
     }
 
     async fn handle_find_calls(&self, args: &Value) -> Value {
+        if self.repos.len() > 1 {
+            let name = args["name"].as_str().unwrap_or("");
+            let mut text = String::new();
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                match mcp_show_calls(&repo.db, name, &git_sha, Context::Any).await {
+                    Ok(output) if !output.trim().is_empty() => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+{}",
+                            repo.name, output
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+error: {e}",
+                            repo.name
+                        ));
+                    }
+                }
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         // Check if database is empty and return helpful message
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
@@ -4253,6 +4390,66 @@ error: {e}",
     }
 
     async fn handle_find_callchain(&self, args: &Value) -> Value {
+        // Workspace fan-out (B1): a chain crosses repositories only through
+        // names; each repo answers its own slice under its header.
+        if self.repos.len() > 1 {
+            let name = args["name"].as_str().unwrap_or("");
+            let mut up_levels = args["up_levels"].as_u64().unwrap_or(2) as usize;
+            let mut down_levels = args["down_levels"].as_u64().unwrap_or(2) as usize;
+            if up_levels == 0 {
+                up_levels = 15;
+            }
+            if down_levels == 0 {
+                down_levels = 15;
+            }
+            let mut text = String::new();
+            for repo in &self.repos {
+                let git_sha =
+                    Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                match mcp_show_callchain_with_limits(
+                    &repo.db,
+                    name,
+                    &git_sha,
+                    up_levels,
+                    down_levels,
+                    50,
+                    Context::Any,
+                )
+                .await
+                {
+                    Ok(output) if !output.trim().is_empty() => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+{}",
+                            repo.name, output
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if !text.is_empty() {
+                            text.push_str(
+                                "
+
+",
+                            );
+                        }
+                        text.push_str(&format!(
+                            "== repo: {} ==
+error: {e}",
+                            repo.name
+                        ));
+                    }
+                }
+            }
+            return json!({ "content": [{ "type": "text", "text": truncate_output(text) }] });
+        }
         // Check if database is empty and return helpful message
         if let Some(refusal) = self.refuse_stale_index().await {
             return refusal;
@@ -4321,6 +4518,27 @@ error: {e}",
             let pattern = args["pattern"].as_str().unwrap_or("");
             let path_pattern = args["path_pattern"].as_str();
             let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+            // format=json fan-out (B3/B4, C42 2026-11-18): every result row
+            // carries its repository, or the bridge cannot place hits from
+            // same-named relative paths across repos.
+            if args["format"].as_str() == Some("json") {
+                let mut all = Vec::new();
+                for repo in &self.repos {
+                    let git_sha =
+                        Self::repo_sha(repo, args["git_sha"].as_str(), args["branch"].as_str());
+                    if let Ok(v) =
+                        grep_json_results(&repo.db, pattern, path_pattern, limit, &git_sha).await
+                    {
+                        if let Some(rows) = v["results"].as_array().cloned() {
+                            for mut row in rows {
+                                row["repo"] = json!(repo.name);
+                                all.push(row);
+                            }
+                        }
+                    }
+                }
+                return json!({ "content": [{ "type": "text", "text": json!({ "results": all }).to_string() }] });
+            }
             let mut text = String::new();
             for repo in &self.repos {
                 let git_sha =
@@ -4414,9 +4632,28 @@ error: {e}",
     }
 
     async fn handle_vgrep_functions(&self, args: &Value) -> Value {
-        // Workspace fan-out for the text format: same model on every db, so
-        // similarity scores are comparable; concatenated per repo.
-        if self.repos.len() > 1 && args["format"].as_str() != Some("json") {
+        // Workspace fan-out: same model on every db, so similarity scores
+        // are comparable. Text concatenates per repo; json (B4) merges rows
+        // with a repo field.
+        if self.repos.len() > 1 && args["format"].as_str() == Some("json") {
+            let query_text = args["query_text"].as_str().unwrap_or("");
+            let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+            let mut all = Vec::new();
+            for repo in &self.repos {
+                if let Ok(v) =
+                    vgrep_json_results(&repo.db, query_text, limit, None, &self.model_path).await
+                {
+                    if let Some(rows) = v["results"].as_array().cloned() {
+                        for mut row in rows {
+                            row["repo"] = json!(repo.name);
+                            all.push(row);
+                        }
+                    }
+                }
+            }
+            return json!({ "content": [{ "type": "text", "text": json!({ "results": all }).to_string() }] });
+        }
+        if self.repos.len() > 1 {
             let query_text = args["query_text"].as_str().unwrap_or("");
             let limit = args["limit"].as_u64().unwrap_or(10) as usize;
             let mut text = String::new();
@@ -7722,26 +7959,37 @@ async fn main() -> Result<()> {
         None => McpServer::new(&database_path, &args.git_repo, args.model_path, args.lazy).await?,
     });
 
-    // Spawn background task to index current commit if needed
-    eprintln!("[Background] Spawning background indexing task");
-    let db_for_indexing = server.db.clone();
-    let git_repo_for_indexing = args.git_repo.clone();
-    let indexing_state_for_bg = server.indexing_state.clone();
-    let notification_tx_for_bg = server.notification_tx.clone();
-    let indexing_handle = tokio::spawn(async move {
-        // Ensure tables exist before indexing
-        if let Err(e) = db_for_indexing.create_tables().await {
-            eprintln!("[Background] Error creating/verifying tables: {}", e);
-        }
+    // Spawn background task to index current commit if needed. Workspace
+    // mode skips it: git_repo defaults to "." (the non-git workspace root),
+    // and the task would poison the shared indexing status with
+    // Failed("Not in a git repository"), refusing every gated tool
+    // (find_calls / find_callchain / find_implementors / find_registrations)
+    // forever — B1, C42 field report 2026-11-18. Per-repo indexing belongs
+    // to the plugin / CLI.
+    let run_background_index = args.workspace.is_none();
+    let indexing_handle = if run_background_index {
+        eprintln!("[Background] Spawning background indexing task");
+        let db_for_indexing = server.db.clone();
+        let git_repo_for_indexing = args.git_repo.clone();
+        let indexing_state_for_bg = server.indexing_state.clone();
+        let notification_tx_for_bg = server.notification_tx.clone();
+        Some(tokio::spawn(async move {
+            // Ensure tables exist before indexing
+            if let Err(e) = db_for_indexing.create_tables().await {
+                eprintln!("[Background] Error creating/verifying tables: {}", e);
+            }
 
-        index_current_commit_background(
-            db_for_indexing,
-            git_repo_for_indexing,
-            indexing_state_for_bg,
-            notification_tx_for_bg,
-        )
-        .await;
-    });
+            index_current_commit_background(
+                db_for_indexing,
+                git_repo_for_indexing,
+                indexing_state_for_bg,
+                notification_tx_for_bg,
+            )
+            .await;
+        }))
+    } else {
+        None
+    };
 
     // Give the background task a chance to start before entering the blocking loop
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -7750,8 +7998,10 @@ async fn main() -> Result<()> {
     run_stdio_server(server).await?;
 
     // Gracefully shutdown the background indexing task
-    indexing_handle.abort();
-    let _ = indexing_handle.await;
+    if let Some(handle) = indexing_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
 
     // The consumer closed stdin (session ended or crashed). Exiting through
     // main would let the runtime wait out any in-flight blocking work — a
