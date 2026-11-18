@@ -3868,7 +3868,18 @@ impl McpServer {
             )
             .await;
             return match result {
-                Ok(output) => json!({ "content": [{ "type": "text", "text": output }] }),
+                // B4: the survey body names its repository — same-named
+                // relative paths across repos are otherwise unplaceable.
+                Ok(output) => {
+                    let with_repo = serde_json::from_str::<Value>(&output)
+                        .ok()
+                        .map(|mut v| {
+                            v["repo"] = json!(repo.name);
+                            v.to_string()
+                        })
+                        .unwrap_or(output);
+                    json!({ "content": [{ "type": "text", "text": with_repo }] })
+                }
                 Err(e) => json!({
                     "error": format!("Failed to survey file: {e}"),
                     "isError": true

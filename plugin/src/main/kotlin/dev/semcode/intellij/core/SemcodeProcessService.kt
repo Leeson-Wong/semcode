@@ -70,21 +70,31 @@ class SemcodeProcessService(private val project: Project) : Disposable {
         stagedBinaries?.let { return it }
         val src = bundledBinariesDir() ?: return null
         val fp = sha256Prefix(File(src, "semcode-index.exe")) ?: return null
-        val stage = File(File(System.getProperty("user.home"), ".semcode/plugin"), fp)
+        // 稳定路径契约（C42 交付手册 §3，2026-11-18）：桥接方 fs.watch 锚定
+        // exe 路径做热部署，路径每次换目录会打断两份配置。固定为 latest/，
+        // 版本替换用 rename 三步舞（运行中的 exe 允许改名，禁止覆盖写）。
+        val stage = File(File(System.getProperty("user.home"), ".semcode/plugin"), "latest")
         val index = File(stage, "semcode-index.exe")
         val mcp = File(stage, "semcode-mcp.exe")
-        if (!(index.isFile && mcp.isFile)) {
-            runCatching {
-                stage.mkdirs()
-                File(src, "semcode-index.exe").copyTo(index, overwrite = true)
-                File(src, "semcode-mcp.exe").copyTo(mcp, overwrite = true)
-            }.onFailure {
-                log.warn("staging bundled binaries failed, running from plugin dir: $it")
-                return src
-            }
-            // 清掉旧指纹的暂存目录，避免堆积（每个 ~400MB 解压体积的拷贝）
-            stage.parentFile?.listFiles()?.forEach { old ->
-                if (old != stage && old.isDirectory) runCatching { old.deleteRecursively() }
+        val stagedOk = index.isFile && mcp.isFile &&
+            sha256Prefix(index) == fp
+        if (!stagedOk) {
+            runCatching { stage.mkdirs() } ?: return src
+            for (name in listOf("semcode-index.exe", "semcode-mcp.exe")) {
+                val target = File(stage, name)
+                val tmp = File(stage, "$name.tmp")
+                runCatching {
+                    File(src, name).copyTo(tmp, overwrite = true)
+                    if (target.isFile) {
+                        val old = File(stage, "$name.old")
+                        old.delete()
+                        target.renameTo(old)
+                    }
+                    tmp.renameTo(target)
+                }.onFailure {
+                    log.warn("staging $name failed, running from plugin dir: $it")
+                    return src
+                }
             }
         }
         stagedBinaries = stage
