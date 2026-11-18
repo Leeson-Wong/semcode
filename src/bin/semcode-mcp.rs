@@ -7753,7 +7753,16 @@ async fn main() -> Result<()> {
     indexing_handle.abort();
     let _ = indexing_handle.await;
 
-    Ok(())
+    // The consumer closed stdin (session ended or crashed). Exiting through
+    // main would let the runtime wait out any in-flight blocking work — a
+    // background auto-index would keep an orphan burning CPU for its whole
+    // run (2026-11-18 field report). The abort above cancels the task; this
+    // guarantees the process dies with its consumer no matter what.
+    #[allow(unreachable_code)]
+    {
+        std::process::exit(0);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

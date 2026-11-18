@@ -35,7 +35,16 @@ object SemcodeAgentConfig {
                 "args",
                 com.google.gson.JsonArray().apply { args.forEach { add(it) } },
             )
-            add("env", JsonObject())
+            // Claude Code 拉起的实例不经插件，资源约束必须随条目走：
+            // 限核 + 低优先级（2026-11-18 实测：无 env 的实例在空库上
+            // 触发后台自动索引，回到全核裸跑）。
+            add(
+                "env",
+                JsonObject().apply {
+                    addProperty("SEMCODE_WORKERS", service.workerLimit().toString())
+                    addProperty("SEMCODE_LOW_PRIORITY", "1")
+                },
+            )
         }
         return try {
             val file = File(root, ".mcp.json")
