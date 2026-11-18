@@ -30,6 +30,7 @@ use crate::types::{
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
 use crate::worktree::{WorkingCopy, WorkingCopyHashes};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -228,12 +229,28 @@ pub struct DatabaseManager {
     callees_memo: std::sync::RwLock<HashMap<CallerMemoKey, Vec<String>>>,
 }
 
+/// The URI to give lancedb for a local database path.
+///
+/// lancedb 0.27 sends every URI that starts with `db` to its LanceDB Cloud
+/// client, not only `db://` ones, so a relative path such as `db/x` or
+/// `dbdata/x` fails to open. Such a path is passed with a leading `./`,
+/// which names the same directory and does not start with `db`. Every
+/// other path passes unchanged. This can go once semcode's lancedb checks
+/// for `db://`.
+fn local_uri(path: &str) -> Cow<'_, str> {
+    if path.starts_with("db") && !path.starts_with("db://") {
+        Cow::Owned(format!("./{path}"))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
 impl DatabaseManager {
     pub async fn new(db_path: &str, git_repo_path: String) -> Result<Self> {
         let database_options = ListingDatabaseOptions::builder()
             .data_storage_version(LanceFileVersion::V2_2)
             .build();
-        let connection = lancedb::connect(db_path)
+        let connection = lancedb::connect(&local_uri(db_path))
             .database_options(&database_options)
             .execute()
             .await?;
@@ -7989,38 +8006,75 @@ impl DatabaseManager {
         Ok(None)
     }
 
-    /// Get all emails that reference a message-id (in in_reply_to or references fields)
-    pub async fn get_lore_emails_referencing(
+    /// Emails that reply to any of `message_ids`: their In-Reply-To or
+    /// References names one of them, as
+    /// [`crate::text_utils::header_names_message_id`] decides. Each email is
+    /// returned once.
+    ///
+    /// A query tests `references` for every id by literal containment, which
+    /// no index serves: it scans that column of the whole table and adds a
+    /// containment pass per id, about 45 ms per id on a table of a million
+    /// emails. Passing a whole thread level shares the scan among its ids,
+    /// but the pass per id remains, so the cost grows with the number of ids.
+    pub async fn get_lore_emails_referencing_any(
         &self,
-        message_id: &str,
+        message_ids: &[String],
     ) -> Result<Vec<crate::types::LoreEmailInfo>> {
         use arrow::array::AsArray;
         use futures::TryStreamExt;
         use std::collections::HashSet;
 
-        // Escape SQL string literal for pattern matching
-        let escaped_message_id = message_id.replace("\\", "\\\\").replace("'", "''");
+        // A query costs about one scan of `references` plus one containment
+        // pass per id, so the chunk size bounds the filter's length more
+        // than it changes the total cost.
+        const IDS_PER_QUERY: usize = 64;
+
+        let ids: Vec<&str> = message_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let table = self.connection.open_table("lore").execute().await?;
+        let mut batches = Vec::new();
+        for chunk in ids.chunks(IDS_PER_QUERY) {
+            // Ids reach the filter only inside SQL string literals, so the
+            // quote is the one character to escape. In-Reply-To is compared
+            // whole, bare and with the leading space a folded header leaves;
+            // `contains` finds References candidates literally, and the
+            // exact match is decided below.
+            let literal = |s: &str| format!("'{}'", s.replace('\'', "''"));
+            let in_reply_to: Vec<String> = chunk
+                .iter()
+                .flat_map(|id| [literal(id), literal(&format!(" {id}"))])
+                .collect();
+            let references: Vec<String> = chunk
+                .iter()
+                .map(|id| format!("contains(`references`, {})", literal(id)))
+                .collect();
+            let filter = format!(
+                "in_reply_to IN ({}) OR {}",
+                in_reply_to.join(", "),
+                references.join(" OR ")
+            );
 
-        // Query 1: Find emails where in_reply_to matches
-        let filter1 = format!("in_reply_to = '{}'", escaped_message_id);
-        let stream1 = table.query().only_if(&filter1).execute().await?;
-        let batches1: Vec<_> = stream1.try_collect().await?;
-
-        // Query 2: Find emails where references contains the message-id
-        let filter2 = format!("regexp_like(`references`, '{}')", escaped_message_id);
-        let stream2 = table.query().only_if(&filter2).execute().await?;
-        let batches2: Vec<_> = stream2.try_collect().await?;
-
-        // Combine batches from both queries
-        let mut batches = batches1;
-        batches.extend(batches2);
+            let chunk_batches: Vec<_> = table
+                .query()
+                .only_if(&filter)
+                .execute()
+                .await?
+                .try_collect()
+                .await?;
+            batches.extend(chunk_batches.into_iter().map(|batch| (chunk, batch)));
+        }
 
         let mut emails = Vec::new();
         let mut seen_message_ids = HashSet::new();
 
-        for batch in batches {
+        for (chunk, batch) in batches {
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -8074,9 +8128,28 @@ impl DatabaseManager {
                 let message_id = message_ids.value(i).to_string();
 
                 // Skip if we've already seen this message_id (deduplication)
-                if !seen_message_ids.insert(message_id.clone()) {
+                if seen_message_ids.contains(&message_id) {
                     continue;
                 }
+
+                // `contains` also matches inside longer ids; keep exact names.
+                // For every header form the query matches, a row that names
+                // an id of another chunk is returned by that chunk's query
+                // too, so its own chunk's ids suffice.
+                let in_reply_to =
+                    (!in_reply_tos.is_null(i)).then(|| in_reply_tos.value(i).to_string());
+                let references =
+                    (!references_list.is_null(i)).then(|| references_list.value(i).to_string());
+                let replies = chunk.iter().any(|id| {
+                    [&in_reply_to, &references]
+                        .into_iter()
+                        .flatten()
+                        .any(|header| crate::text_utils::header_names_message_id(header, id))
+                });
+                if !replies {
+                    continue;
+                }
+                seen_message_ids.insert(message_id.clone());
 
                 // Parse JSON symbols array
                 let symbols_json = symbols_list.value(i);
@@ -8088,17 +8161,9 @@ impl DatabaseManager {
                     date: dates.value(i).to_string(),
                     date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
                     message_id,
-                    in_reply_to: if in_reply_tos.is_null(i) {
-                        None
-                    } else {
-                        Some(in_reply_tos.value(i).to_string())
-                    },
+                    in_reply_to,
                     subject: subjects.value(i).to_string(),
-                    references: if references_list.is_null(i) {
-                        None
-                    } else {
-                        Some(references_list.value(i).to_string())
-                    },
+                    references,
                     recipients: recipients_list.value(i).to_string(),
                     body: bodies.value(i).to_string(),
                     symbols,
@@ -9731,5 +9796,39 @@ mod anonymous_members {
     fn a_plain_edge_never_addresses_a_qualified_target() {
         // "read" alone cannot reach Io::read; only its owner-tagged twin can.
         assert!(!DatabaseManager::calls_json_names_function(r#"["read"]"#, "Io::read").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod local_uri_tests {
+    use super::local_uri;
+
+    #[test]
+    fn paths_starting_with_db_get_a_leading_dot_slash() {
+        for (path, uri) in [
+            ("db/x", "./db/x"),
+            ("dbx/y", "./dbx/y"),
+            ("db", "./db"),
+            ("dbx:y", "./dbx:y"),
+        ] {
+            assert_eq!(local_uri(path), uri, "{path}");
+        }
+    }
+
+    #[test]
+    fn every_other_path_passes_unchanged() {
+        for path in [
+            "./db/x",
+            "../db",
+            "/abs/db",
+            "x/db",
+            ".semcode.db",
+            "file:/abs/db",
+            "db://cloud",
+            "s3://bucket/db",
+            "",
+        ] {
+            assert_eq!(local_uri(path), path, "{path}");
+        }
     }
 }

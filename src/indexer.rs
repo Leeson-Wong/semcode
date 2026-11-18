@@ -17,6 +17,31 @@ use tracing::{debug, error, info, warn};
 use crate::git::resolve_to_commit;
 use crate::{DatabaseManager, GitCommitInfo, LoreIdState};
 
+/// Receive from a std channel shared by several inserter tasks without
+/// holding a tokio worker while waiting.
+///
+/// `f` runs on the blocking pool with the receiver locked, so a task waiting
+/// for a batch, or for another task to release the receiver, occupies a
+/// blocking-pool thread instead of a runtime worker. Returns `None` if the
+/// receiver's lock is poisoned, or if the runtime shut down before `f` ran.
+/// A panic in `f` is resumed in the caller. Dropping the returned future
+/// does not stop `f`; anything it received is lost.
+pub(crate) async fn recv_shared<T, R>(
+    rx: &Arc<std::sync::Mutex<mpsc::Receiver<T>>>,
+    f: impl FnOnce(&mpsc::Receiver<T>) -> R + Send + 'static,
+) -> Option<R>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    let rx = Arc::clone(rx);
+    match tokio::task::spawn_blocking(move || rx.lock().ok().map(|rx| f(&rx))).await {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => None,
+    }
+}
+
 /// Perform periodic optimization check during indexing operations
 /// Returns true if optimization was performed, false otherwise
 pub async fn check_and_optimize_if_needed(
@@ -607,6 +632,67 @@ fn extract_symbols_from_email_body(body: &str) -> Vec<String> {
     }
 }
 
+/// Extract metadata for each commit SHA received from `commit_rx` until it
+/// closes, sending it to `result_tx` in batches of `batch_size`. `repo` is
+/// the pipeline's one object store, shared by every worker.
+fn commit_metadata_worker(
+    worker_id: usize,
+    repo: gix::ThreadSafeRepository,
+    commit_rx: Arc<std::sync::Mutex<mpsc::Receiver<String>>>,
+    result_tx: mpsc::SyncSender<Vec<GitCommitInfo>>,
+    processed: Arc<AtomicUsize>,
+    batch_size: usize,
+) {
+    let repo = repo.to_thread_local();
+    let mut batch = Vec::new();
+
+    loop {
+        // Get next commit SHA
+        let commit_sha = {
+            match commit_rx.lock() {
+                Ok(rx) => rx.recv(),
+                Err(e) => {
+                    tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
+                    break;
+                }
+            }
+        };
+
+        match commit_sha {
+            Ok(sha) => {
+                match extract_commit_metadata(&repo, &sha) {
+                    Ok(metadata) => {
+                        batch.push(metadata);
+                        processed.fetch_add(1, Ordering::Relaxed);
+
+                        // Send batch when it reaches batch_size
+                        if batch.len() >= batch_size {
+                            if result_tx.send(batch.clone()).is_err() {
+                                break;
+                            }
+                            batch.clear();
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Worker {} failed to extract metadata for {}: {}",
+                            worker_id, sha, e
+                        );
+                        processed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            Err(_) => {
+                // Channel closed, send remaining batch
+                if !batch.is_empty() {
+                    let _ = result_tx.send(batch);
+                }
+                break;
+            }
+        }
+    }
+}
+
 /// Process commits using a streaming pipeline
 pub async fn process_commits_pipeline(
     repo_path: &std::path::Path,
@@ -619,6 +705,13 @@ pub async fn process_commits_pipeline(
 ) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use std::sync::Mutex;
+
+    // One object store for every worker. Each store maps the pack files on
+    // its own and `VmRSS` counts a mapped page once per mapping, so a store
+    // per worker counts the repository's packs once per worker.
+    let shared_repo = gix::discover(repo_path)
+        .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?
+        .into_sync();
 
     // Create progress bar
     let pb = ProgressBar::new(commit_shas.len() as u64);
@@ -681,66 +774,18 @@ pub async fn process_commits_pipeline(
     for worker_id in 0..num_workers {
         let worker_commit_rx = shared_commit_rx.clone();
         let worker_result_tx = result_tx.clone();
-        let worker_repo_path = repo_path.to_path_buf();
+        let worker_repo = shared_repo.clone();
         let worker_processed = processed_count.clone();
 
         let handle = thread::spawn(move || {
-            // Open repository ONCE per worker thread, reuse for all commits
-            let thread_repo = match gix::discover(&worker_repo_path) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Worker {} failed to open repository: {}", worker_id, e);
-                    return;
-                }
-            };
-
-            let mut batch = Vec::new();
-
-            loop {
-                // Get next commit SHA
-                let commit_sha = {
-                    match worker_commit_rx.lock() {
-                        Ok(rx) => rx.recv(),
-                        Err(e) => {
-                            tracing::error!("Worker {} failed to lock receiver: {}", worker_id, e);
-                            break;
-                        }
-                    }
-                };
-
-                match commit_sha {
-                    Ok(sha) => {
-                        match extract_commit_metadata(&thread_repo, &sha) {
-                            Ok(metadata) => {
-                                batch.push(metadata);
-                                worker_processed.fetch_add(1, Ordering::Relaxed);
-
-                                // Send batch when it reaches batch_size
-                                if batch.len() >= batch_size {
-                                    if worker_result_tx.send(batch.clone()).is_err() {
-                                        break;
-                                    }
-                                    batch.clear();
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Worker {} failed to extract metadata for {}: {}",
-                                    worker_id, sha, e
-                                );
-                                worker_processed.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Channel closed, send remaining batch
-                        if !batch.is_empty() {
-                            let _ = worker_result_tx.send(batch);
-                        }
-                        break;
-                    }
-                }
-            }
+            commit_metadata_worker(
+                worker_id,
+                worker_repo,
+                worker_commit_rx,
+                worker_result_tx,
+                worker_processed,
+                batch_size,
+            )
         });
         worker_handles.push(handle);
     }
@@ -778,10 +823,9 @@ pub async fn process_commits_pipeline(
         let handle = tokio::spawn(async move {
             loop {
                 // Get next batch from shared receiver
-                let batch = {
-                    let rx = result_rx_clone.lock().unwrap();
-                    rx.recv()
-                };
+                let batch = recv_shared(&result_rx_clone, |rx| rx.recv())
+                    .await
+                    .expect("commit inserter receiver lock poisoned");
 
                 match batch {
                     Ok(batch) => {
@@ -1067,21 +1111,23 @@ pub async fn process_lore_commits_pipeline(
                 // Otherwise each parser's last partial batch becomes
                 // its own small append, dozens of tiny fragments per
                 // archive on a refresh.
-                let batch = {
-                    match result_rx_clone.lock() {
-                        Ok(rx) => rx.recv().map(|mut emails| {
-                            while emails.len() < batch_size {
-                                match rx.recv() {
-                                    Ok(more) => emails.extend(more),
-                                    Err(_) => break,
-                                }
+                let batch = match recv_shared(&result_rx_clone, move |rx| {
+                    rx.recv().map(|mut emails| {
+                        while emails.len() < batch_size {
+                            match rx.recv() {
+                                Ok(more) => emails.extend(more),
+                                Err(_) => break,
                             }
-                            emails
-                        }),
-                        Err(e) => {
-                            error!("Inserter {} failed to lock receiver: {}", inserter_id, e);
-                            break;
                         }
+                        emails
+                    })
+                })
+                .await
+                {
+                    Some(batch) => batch,
+                    None => {
+                        error!("Inserter {} failed to lock receiver", inserter_id);
+                        break;
                     }
                 };
 
@@ -1270,27 +1316,103 @@ pub async fn index_git_commits(
 mod tests {
     use super::*;
 
+    /// Two inserter-style tasks waiting on a shared receiver whose sender
+    /// stays alive must leave the runtime's two workers free for other work.
+    /// The test body runs on the `block_on` thread, not on a worker, and
+    /// waits with std primitives, so it still fails (rather than hangs) if
+    /// the waiters do occupy both workers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_shared_does_not_hold_workers() {
+        let (tx, rx) = mpsc::channel::<u32>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let entered = Arc::new(AtomicUsize::new(0));
+
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let rx = Arc::clone(&rx);
+                let entered = Arc::clone(&entered);
+                tokio::spawn(async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    recv_shared(&rx, |rx| rx.recv()).await
+                })
+            })
+            .collect();
+
+        // Each waiter increments `entered` on a worker right before it
+        // starts waiting.  Once both have, waiters that block their workers
+        // would now hold both.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while entered.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiters never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        tokio::spawn(async move {
+            let _ = done_tx.send(7);
+        });
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(7),
+            "a task spawned while two receivers wait never ran"
+        );
+
+        drop(tx);
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap(), Some(Err(mpsc::RecvError)));
+        }
+    }
+
     /// Helper: run a git command in a directory, panic on failure.
     fn git(repo: &std::path::Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            // Do not inherit developer's git configuration.
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "test@test.com")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "test@test.com")
-            .output()
-            .expect("git command failed to execute");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        crate::git::test_git(repo, args)
+    }
+
+    /// The metadata workers read through the store they are handed. A
+    /// worker that opened a store of its own would map the repository's
+    /// packs again, and the handed store's pack would stay unopened.
+    #[test]
+    fn commit_metadata_workers_read_through_the_store_they_are_handed() {
+        let (dir, commits) = crate::git::packed_test_repo();
+        let repo = gix::discover(dir.path()).unwrap().into_sync();
+        assert_eq!(repo.objects.metrics().open_reachable_packs, 0);
+
+        let (commit_tx, commit_rx) = mpsc::channel();
+        for commit in &commits {
+            commit_tx.send(commit.clone()).unwrap();
+        }
+        drop(commit_tx);
+        let commit_rx = Arc::new(std::sync::Mutex::new(commit_rx));
+        let (result_tx, result_rx) = mpsc::sync_channel(16);
+        let processed = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..4)
+            .map(|worker_id| {
+                let (repo, commit_rx, result_tx, processed) = (
+                    repo.clone(),
+                    commit_rx.clone(),
+                    result_tx.clone(),
+                    processed.clone(),
+                );
+                thread::spawn(move || {
+                    commit_metadata_worker(worker_id, repo, commit_rx, result_tx, processed, 1)
+                })
+            })
+            .collect();
+        drop(result_tx);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let mut extracted: Vec<String> = result_rx.iter().flatten().map(|c| c.git_sha).collect();
+        extracted.sort();
+        let mut expected = commits.clone();
+        expected.sort();
+        assert_eq!(extracted, expected);
+        assert_eq!(processed.load(Ordering::Relaxed), 2);
+        assert_eq!(repo.objects.metrics().open_reachable_packs, 1);
     }
 
     /// Build a repo with merge topology and a tag on the side branch:
