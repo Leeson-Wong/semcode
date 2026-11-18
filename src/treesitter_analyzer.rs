@@ -58,7 +58,9 @@ pub enum Language {
 /// 2: qualified static-call edges — a PascalCase receiver (`Log.i`) now
 /// keeps its qualified spelling and the bare member edge is dropped
 /// (shared call extraction + Java/Kotlin queries).
-pub const EXTRACTOR_VERSION: u32 = 2;
+/// 3: positional initializer slots recorded as `@N` registrations
+/// (INDIGO-style), named by the post-index slot-resolution pass.
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// Grammar versions, pinned to Cargo.lock by `grammar_versions_match_the_lockfile`.
 /// A bump re-reads only its language: each file records the version of
@@ -4509,6 +4511,56 @@ impl TreeSitterAnalyzer {
         found
     }
 
+    /// Positional initializer slots as `@N` registrations (B6).
+    ///
+    /// Only bare identifiers (and `&identifier`) can name functions, and
+    /// only in a list with no designated anchor. Nested lists occupy a slot
+    /// but never name a function, so the index arithmetic stays honest.
+    fn positional_slots(
+        list: tree_sitter::Node,
+        source: &str,
+        container_type: &str,
+        container_base_type: Option<&str>,
+        container_field: Option<&str>,
+    ) -> Vec<RawRegistration> {
+        if container_type.is_empty() && container_base_type.is_none() {
+            return Vec::new();
+        }
+        let mut cursor = list.walk();
+        let children: Vec<tree_sitter::Node> = list.named_children(&mut cursor).collect();
+        if children.is_empty() || children.iter().any(|c| c.kind() == "initializer_pair") {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        for (slot, child) in children.iter().enumerate() {
+            let target_node = match child.kind() {
+                "identifier" => Some(*child),
+                "pointer_expression" => child
+                    .child_by_field_name("argument")
+                    .filter(|a| a.kind() == "identifier"),
+                _ => None,
+            };
+            let Some(target_node) = target_node else {
+                continue;
+            };
+            let target = source[target_node.byte_range()].to_string();
+            if target.is_empty() {
+                continue;
+            }
+            found.push(RawRegistration {
+                container_type: container_type.to_string(),
+                container_base_type: container_base_type.map(str::to_string),
+                container_field: container_field.map(str::to_string),
+                member: format!("@{slot}"),
+                target,
+                byte_start: target_node.start_byte(),
+                line: target_node.start_position().row as u32 + 1,
+                kind: RegistrationKind::PositionalInit,
+            });
+        }
+        found
+    }
+
     /// Elements of a table held in a struct field.
     ///
     /// Every element has to be a plain name for the list to be a table of
@@ -4664,6 +4716,23 @@ impl TreeSitterAnalyzer {
                     } else {
                         (String::new(), Some(outer_type), Some(path.join(".")))
                     };
+
+                    // Positional slots (B6, C42 2026-11-18): INDIGO registers
+                    // functions by slot order — { ..., client_attach, ... } —
+                    // and no designator names the member. The slot index is
+                    // recorded as "@N"; a post-index pass names it from the
+                    // struct's field order and drops slots that are not
+                    // function pointers. A list with any designator is not
+                    // purely positional: slot arithmetic past a designated
+                    // anchor is C99-subtle, so the whole list is skipped —
+                    // for an audit tool a missing row beats a wrong one.
+                    facts.registrations.extend(Self::positional_slots(
+                        node,
+                        source,
+                        &container_type,
+                        container_base_type.as_deref(),
+                        container_field.as_deref(),
+                    ));
 
                     for (member_node, value) in Self::initializer_members(node) {
                         let member = source[member_node.byte_range()].to_string();

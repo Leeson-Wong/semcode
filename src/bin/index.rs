@@ -1764,6 +1764,20 @@ async fn run_pipeline(args: Args) -> Result<()> {
             .await?;
         }
 
+        // Positional-slot registrations name their members now that every
+        // file's types are in the database (B6): @N → the N-th field of the
+        // container struct, kept only where that field is a function pointer.
+        match db_manager.resolve_slot_registrations().await {
+            Ok((resolved, dropped)) => {
+                if resolved + dropped > 0 {
+                    println!(
+                        "Positional registrations: {resolved} resolved to member names, {dropped} dropped (no struct / not a function pointer)"
+                    );
+                }
+            }
+            Err(e) => warn!("positional registration resolution failed: {}", e),
+        }
+
         // The tree is one commit deep; the history behind it is what makes
         // the commit tools usable on ordinary projects. Record which branch
         // the tree was read at (list_branches), and walk the recent history

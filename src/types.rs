@@ -1258,6 +1258,10 @@ pub enum RegistrationKind {
     DesignatedInit,
     /// `x->member = target;` or `x.member = target;`
     Assignment,
+    /// `{ ..., target, ... }` positional slot N inside an initializer; the
+    /// member is `@N` until the slot-resolution pass names it from the
+    /// struct's field order (INDIGO-style registration, C42 B6).
+    PositionalInit,
 }
 
 impl RegistrationKind {
@@ -1265,6 +1269,7 @@ impl RegistrationKind {
         match self {
             RegistrationKind::DesignatedInit => "designated_init",
             RegistrationKind::Assignment => "assignment",
+            RegistrationKind::PositionalInit => "positional_init",
         }
     }
 
@@ -1272,6 +1277,7 @@ impl RegistrationKind {
         match text {
             "designated_init" => Some(RegistrationKind::DesignatedInit),
             "assignment" => Some(RegistrationKind::Assignment),
+            "positional_init" => Some(RegistrationKind::PositionalInit),
             _ => None,
         }
     }

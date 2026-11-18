@@ -1136,6 +1136,79 @@ impl DatabaseManager {
         self.registration_store.insert_batch(registrations).await
     }
 
+    /// Name the positional-slot registrations (B6, C42 2026-11-18).
+    ///
+    /// The extractor records `{..., client_attach, ...}` as `@N` because the
+    /// slot→member mapping needs the struct's field order, which usually
+    /// lives in a header the analyzed file never saw. After the run's files
+    /// are all in the types table, this pass maps each `@N` to the N-th
+    /// field of its container and keeps the row only when that field is a
+    /// function pointer — a string slot fed by an identifier (an enum
+    /// constant, a macro) is noise an audit tool must not show. A container
+    /// without a stored definition, or a slot past the field count
+    /// (#ifdef-shaped struct), drops its rows: for this tool a missing row
+    /// beats a wrong one. Returns (resolved, dropped).
+    pub async fn resolve_slot_registrations(&self) -> Result<(usize, usize)> {
+        let stale = self.registration_store.find_slot_registrations().await?;
+        if stale.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut by_container: std::collections::HashMap<String, Vec<crate::types::Registration>> =
+            std::collections::HashMap::new();
+        for row in stale {
+            let container = if row.container_type.is_empty() {
+                row.container_base_type.clone().unwrap_or_default()
+            } else {
+                row.container_type.clone()
+            };
+            by_container.entry(container).or_default().push(row);
+        }
+
+        let mut resolved = Vec::new();
+        let mut dropped = 0usize;
+        for (container, rows) in by_container {
+            if container.is_empty() {
+                dropped += rows.len();
+                continue;
+            }
+            // The types table spells struct rows "struct X"; the declaration
+            // spells the typedef name. Try both before giving up.
+            let fields = match self.find_type(&container).await {
+                Ok(Some(t)) if !t.members.is_empty() => t.members,
+                _ => match self.find_type(&format!("struct {container}")).await {
+                    Ok(Some(t)) if !t.members.is_empty() => t.members,
+                    _ => {
+                        dropped += rows.len();
+                        continue;
+                    }
+                },
+            };
+            for mut row in rows {
+                let slot: usize = row.member[1..].parse().unwrap_or(usize::MAX);
+                let Some(field) = fields.get(slot) else {
+                    dropped += 1;
+                    continue;
+                };
+                if !field.type_name.contains("(*") {
+                    dropped += 1;
+                    continue;
+                }
+                row.member = field.name.clone();
+                row.kind = crate::types::RegistrationKind::DesignatedInit;
+                resolved.push(row);
+            }
+        }
+
+        let stale_all = self.registration_store.find_slot_registrations().await?;
+        self.registration_store
+            .delete_slot_registrations(&stale_all)
+            .await?;
+        let resolved_count = resolved.len();
+        self.registration_store.insert_batch(resolved).await?;
+        Ok((resolved_count, dropped))
+    }
+
     /// Record file-scope variables of aggregate type.
     pub async fn insert_globals(&self, globals: Vec<crate::types::GlobalVariable>) -> Result<()> {
         self.global_store.insert_batch(globals).await

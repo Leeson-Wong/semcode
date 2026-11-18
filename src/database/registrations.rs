@@ -159,6 +159,35 @@ impl RegistrationStore {
             .await
     }
 
+    /// Every unresolved positional slot (`@N`, kind positional_init) - the
+    /// input to the slot-resolution pass (B6).
+    pub async fn find_slot_registrations(&self) -> Result<Vec<Registration>> {
+        self.query("member LIKE '@%'").await
+    }
+
+    /// Remove the rows the resolution pass rewrote or dropped: identified by
+    /// (member, target, file_path, byte_start), which the extractor made
+    /// unique per slot occurrence.
+    pub async fn delete_slot_registrations(&self, stale: &[Registration]) -> Result<()> {
+        let table = self
+            .connection
+            .open_table("registrations")
+            .execute()
+            .await?;
+        for row in stale {
+            let quote = |v: &str| v.replace('\'', "''");
+            let filter = format!(
+                "member = '{}' AND target = '{}' AND file_path = '{}' AND byte_start = {}",
+                quote(&row.member),
+                quote(&row.target),
+                quote(&row.file_path),
+                row.byte_start
+            );
+            table.delete(&filter).await?;
+        }
+        Ok(())
+    }
+
     async fn query(&self, filter: &str) -> Result<Vec<Registration>> {
         let table = self
             .connection
