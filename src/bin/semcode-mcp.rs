@@ -4536,6 +4536,67 @@ error: {e}",
     }
 
     async fn handle_find_commit(&self, args: &Value) -> Value {
+        // Workspace fan-out (2026-11-18 field test: git archaeology silently
+        // answered from the first repository only). The three branches below
+        // build a CommitFilterParams bound to self.git_repo_path; here each
+        // repo answers with its own.
+        if self.repos.len() > 1 {
+            let extract = |key: &str| -> Vec<String> {
+                args[key]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let author = extract("author_patterns");
+            let subject = extract("subject_patterns");
+            let regex = extract("regex_patterns");
+            let symbol = extract("symbol_patterns");
+            let path = extract("path_patterns");
+            let verbose = args["verbose"].as_bool().unwrap_or(false);
+            let reachable = args["reachable_sha"].as_str();
+
+            let mut text = String::new();
+            for repo in &self.repos {
+                let params = CommitFilterParams {
+                    verbose,
+                    author_patterns: &author,
+                    subject_patterns: &subject,
+                    regex_patterns: &regex,
+                    symbol_patterns: &symbol,
+                    path_patterns: &path,
+                    reachable_sha: reachable,
+                    git_repo_path: &repo.git_repo_path,
+                };
+                let result = match args["git_range"].as_str() {
+                    Some(range) => mcp_show_commit_range(&repo.db, range, &params).await,
+                    None => mcp_show_all_commits(&repo.db, &params).await,
+                };
+                let body = match result {
+                    Ok(out) => out,
+                    Err(e) => format!("error: {e}"),
+                };
+                if body.trim().is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push_str(
+                        "
+
+",
+                    );
+                }
+                text.push_str(&format!(
+                    "== repo: {} ==
+{}",
+                    repo.name, body
+                ));
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
         let git_ref = args["git_ref"].as_str();
         let git_range = args["git_range"].as_str();
 
@@ -4758,6 +4819,51 @@ error: {e}",
             reachable_sha.unwrap_or(""),
             limit
         );
+
+        // Workspace fan-out: each repo's commits live in its own db and
+        // history (2026-11-18 field test caught this answering from the
+        // first repository only).
+        if self.repos.len() > 1 {
+            let mut text = String::new();
+            for repo in &self.repos {
+                let params = VCommitParams {
+                    query_text,
+                    limit,
+                    author_patterns: &author_patterns,
+                    subject_patterns: &subject_patterns,
+                    regex_patterns: &regex_patterns,
+                    symbol_patterns: &symbol_patterns,
+                    path_patterns: &path_patterns,
+                    git_range,
+                    reachable_sha,
+                    git_repo_path: &repo.git_repo_path,
+                    model_path: &self.model_path,
+                };
+                let body = match mcp_vcommit_similar_commits(&repo.db, &params).await {
+                    Ok(out) => out,
+                    Err(e) => format!("error: {e}"),
+                };
+                if body.trim().is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push_str(
+                        "
+
+",
+                    );
+                }
+                text.push_str(&format!(
+                    "== repo: {} ==
+{}",
+                    repo.name, body
+                ));
+            }
+            if text.is_empty() {
+                text = "No similar commits found in any repository.".into();
+            }
+            return json!({ "content": [{ "type": "text", "text": text }] });
+        }
 
         // Use the --git-repo path: the server's CWD is not necessarily
         // the indexed repository (e.g. launched with an explicit -d).
