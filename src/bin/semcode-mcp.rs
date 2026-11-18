@@ -8317,7 +8317,7 @@ mod tests {
         db.create_lore_fts_indices().await.unwrap();
 
         let server = McpServer {
-            db,
+            db: Arc::clone(&db),
             database_path: String::new(),
             default_git_sha: None,
             model_path: None,
@@ -8326,6 +8326,12 @@ mod tests {
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
             lazy_mode: false,
+            repos: vec![WorkspaceRepo {
+                name: String::new(),
+                db,
+                git_repo_path: ".".to_string(),
+                default_git_sha: None,
+            }],
         };
 
         let text = |response: &Value| response["content"][0]["text"].as_str().unwrap().to_string();
