@@ -159,4 +159,37 @@ mod tests {
         assert!(processed.len() <= 8192);
         assert!(processed.is_ascii() || std::str::from_utf8(processed.as_bytes()).is_ok());
     }
+
+    #[test]
+    fn chinese_comment_survives_preprocessing() {
+        // The 0.7.0 model swap proved comments are the carrier of
+        // natural-language semantics: Chinese queries matched Chinese doc
+        // comments at 11/16 hit@3 with them, 1/16 without. This locks
+        // the keep-comments behavior so nobody re-adds the strip.
+        let input = "int foo(void) { /* 中文注释 */ return 0; } // 行注释";
+        let processed = preprocess_code(input);
+        assert!(
+            processed.contains("中文注释"),
+            "block comment text: {processed:?}"
+        );
+        assert!(
+            processed.contains("行注释"),
+            "line comment text: {processed:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_macro_and_inline_asm_still_stripped() {
+        // Comments stay, but the kernel-specific noise still goes — both
+        // behaviors coexist since 0.7.0.
+        let input = r#"__attribute__((packed)) struct s { int x; };
+            EXPORT_SYMBOL(s);
+            // keep me
+            void f() { asm volatile("nop"); }"#;
+        let processed = preprocess_code(input);
+        assert!(!processed.contains("__attribute__"));
+        assert!(!processed.contains("EXPORT_SYMBOL"));
+        assert!(!processed.contains("asm volatile"));
+        assert!(processed.contains("keep me"));
+    }
 }

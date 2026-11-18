@@ -15310,4 +15310,343 @@ mod config_variant_tests {
             ]
         );
     }
+
+    // ================================================================
+    // Positional registration extraction (B6, C42 2026-11-18)
+    //
+    // INDIGO registers functions by slot order — {…, client_attach, …} —
+    // with no designator. These tests lock the extractor's behavior so a
+    // grammar change or refactor cannot silently alter what an audit tool
+    // reports.
+    // ================================================================
+
+    /// The registrations a source's positional initializers produce, as
+    /// (container, member, target, kind) tuples, sorted.
+    fn positional_registrations_of(
+        source: &str,
+        path: &str,
+    ) -> Vec<(String, String, String, String)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "hash", None)
+            .unwrap();
+        let mut found: Vec<_> = analysis
+            .registrations
+            .iter()
+            .map(|r| {
+                (
+                    r.container_type.clone(),
+                    r.member.clone(),
+                    r.target.clone(),
+                    r.kind.as_str().to_string(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn positional_slots_map_to_struct_field_order() {
+        // A pure positional initializer with a same-file struct: each
+        // bare-identifier slot is recorded as @N, later resolved by the
+        // post-index pass to the N-th field name. A string slot is not
+        // an identifier and records nothing.
+        let source = r#"
+            struct ops {
+                const char *name;
+                int (*start)(void);
+                int (*stop)(void);
+            };
+            static struct ops my_ops = {
+                "driver",
+                drv_start,
+                drv_stop,
+            };
+        "#;
+        let found = positional_registrations_of(source, "positional_basic.c");
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "ops".to_string(),
+                    "@1".to_string(),
+                    "drv_start".to_string(),
+                    "positional_init".to_string()
+                ),
+                (
+                    "ops".to_string(),
+                    "@2".to_string(),
+                    "drv_stop".to_string(),
+                    "positional_init".to_string()
+                ),
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn positional_slots_drop_when_any_designated_anchor_present() {
+        // A mixed list with even one designator is not purely positional:
+        // slot arithmetic past a designated anchor is C99-subtle, so the
+        // whole list is skipped (宁缺勿错 — for an audit tool, a missing
+        // row beats a wrong one).
+        let source = r#"
+            struct ops {
+                const char *name;
+                int (*start)(void);
+                int (*stop)(void);
+            };
+            static struct ops mixed = {
+                "driver",
+                .stop = alt_stop,
+                drv_start,
+            };
+        "#;
+        let found = positional_registrations_of(source, "positional_mixed.c");
+        // The designated `.stop = alt_stop` is recorded by the designated
+        // path, but the positional slots are all skipped.
+        assert!(
+            found
+                .iter()
+                .all(|(_, member, _, _)| !member.starts_with('@')),
+            "positional slots must be absent from a mixed list: {found:?}"
+        );
+        // The designated one is still there.
+        assert!(
+            found
+                .iter()
+                .any(|(_, member, target, _)| member == "stop" && target == "alt_stop"),
+            "designated registration survives: {found:?}"
+        );
+    }
+
+    #[test]
+    fn positional_slots_nested_initializer_occupies_one_slot() {
+        // A nested brace list occupies one slot in the outer mapping but
+        // never names a function, so the index arithmetic stays honest.
+        let source = r#"
+            struct inner { int a; int b; };
+            struct outer {
+                struct inner pos0;
+                int (*fn)(void);
+            };
+            static struct outer o = {
+                { 1, 2 },
+                real_fn,
+            };
+        "#;
+        let found = positional_registrations_of(source, "positional_nested.c");
+        assert_eq!(
+            found,
+            vec![(
+                "outer".to_string(),
+                "@1".to_string(),
+                "real_fn".to_string(),
+                "positional_init".to_string()
+            )],
+            "nested list at slot 0 does not shift the mapping: {found:?}"
+        );
+    }
+
+    #[test]
+    fn positional_slots_empty_and_no_container_yield_nothing() {
+        // An empty initializer list or one whose container cannot be read
+        // from the declaration records nothing.
+        let empty = r#"
+            struct ops { int (*fn)(void); };
+            static struct ops e = { };
+        "#;
+        assert!(positional_registrations_of(empty, "positional_empty.c").is_empty());
+
+        // No declaration type: the list has no container to attribute to.
+        let no_type = r#"
+            static int arr[] = { 1, 2, 3 };
+        "#;
+        assert!(positional_registrations_of(no_type, "positional_nocontainer.c").is_empty());
+    }
+
+    #[test]
+    fn positional_slots_pointer_expression_target_is_identifier() {
+        // `&identifier` is a function pointer taking syntax, just as in
+        // designated initializers; a non-identifier argument is not.
+        let source = r#"
+            struct ops { int (*fn)(void); };
+            static struct ops p = {
+                &my_func,
+            };
+        "#;
+        let found = positional_registrations_of(source, "positional_ptr.c");
+        assert_eq!(
+            found,
+            vec![(
+                "ops".to_string(),
+                "@0".to_string(),
+                "my_func".to_string(),
+                "positional_init".to_string()
+            )],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn positional_slots_typedef_name_resolves_to_struct_container() {
+        // The declaration says the typedef name; the registrations carry
+        // that name, and the post-index resolver looks up "struct X" from
+        // the types table.
+        let source = r#"
+            typedef struct my_ops {
+                const char *tag;
+                int (*init)(void);
+            } my_ops;
+            static my_ops instance = {
+                "test",
+                op_init,
+            };
+        "#;
+        let found = positional_registrations_of(source, "positional_typedef.c");
+        assert_eq!(
+            found,
+            vec![(
+                "my_ops".to_string(),
+                "@1".to_string(),
+                "op_init".to_string(),
+                "positional_init".to_string()
+            )],
+            "{found:?}"
+        );
+    }
+
+    // ================================================================
+    // Kotlin behavior locks (2026-11-18: preventing grammar/refactor
+    // regressions from silently changing what gets indexed)
+    // ================================================================
+
+    #[test]
+    fn kotlin_vararg_rides_in_sibling_modifier_node() {
+        // The fwcd grammar puts parameter_modifiers as a SIBLING before
+        // the parameter it modifies — not as a child of the parameter.
+        // This locks the AST shape assumption the reader depends on.
+        let source = "fun f(vararg items: String) { println(items) }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new("Vararg.kt"), "hash", None)
+            .unwrap();
+        let f = analysis.functions.iter().find(|x| x.name == "f").unwrap();
+        assert_eq!(f.parameters.len(), 1);
+        assert_eq!(f.parameters[0].name, "items");
+        assert_eq!(f.parameters[0].type_name, "String...");
+    }
+
+    #[test]
+    fn kotlin_interface_reads_as_class_kind() {
+        // The grammar spells interfaces as a modifier on class_declaration,
+        // which no query can split without double-matching. The analyzer
+        // reads kind "class" for both — locked here so a future query
+        // change that accidentally introduces duplication is caught.
+        // The survey reads the modifier in code and reports "interface".
+        let source = "interface Hook { fun onStart() {} }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new("Hook.kt"), "hash", None)
+            .unwrap();
+        assert_eq!(analysis.types.len(), 1);
+        assert_eq!(analysis.types[0].kind, "class");
+    }
+
+    #[test]
+    fn kotlin_unnamed_companion_takes_implicit_name() {
+        // `companion object { }` with no declared name carries the
+        // language's implicit name "Companion" as its qualifier.
+        let source =
+            "class Outer {\n    companion object {\n        fun create() = Outer()\n    }\n}\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new("Outer.kt"), "hash", None)
+            .unwrap();
+        let create = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "create")
+            .unwrap();
+        assert_eq!(create.qualifier.as_deref(), Some("Outer.Companion"));
+    }
+
+    // ================================================================
+    // Static-call edge behavior locks (2026-11-18)
+    // ================================================================
+
+    #[test]
+    fn static_call_edge_keeps_qualified_name_and_drops_bare() {
+        // A PascalCase receiver (`Log.i`) names a type: the edge keeps
+        // the qualified spelling, and the bare member edge the plain
+        // pattern recorded for the same site is dropped by position.
+        // A camelCase receiver (`other.refresh`) is a variable: the bare
+        // name-level edge survives, no qualified edge is created.
+        let source = "package com.example\n\
+             class S {\n\
+             \tfun render() {\n\
+             \t\tLog.i(\"tag\", \"msg\")\n\
+             \t\tother.refresh()\n\
+             \t}\n\
+             \tfun refresh() {}\n\
+             }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new("S.kt"), "hash", None)
+            .unwrap();
+        let render = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "render")
+            .unwrap();
+        let mut calls = render.calls.clone().unwrap_or_default();
+        calls.sort();
+        calls.dedup();
+        let debug = format!("{calls:?}");
+        assert!(
+            debug.contains("Log.i"),
+            "qualified static edge present: {debug}"
+        );
+        assert!(
+            !debug.split('"').any(|s| s == "i"),
+            "bare `i` edge absent (replaced by qualified): {debug}"
+        );
+        assert!(
+            debug.split('"').any(|s| s == "refresh"),
+            "camelCase receiver keeps bare member edge: {debug}"
+        );
+    }
+
+    #[test]
+    fn java_static_call_edge_matches_kotlin_behavior() {
+        // The same rule in Java: `Objects.requireNonNull(xs)` (short form,
+        // receiver is a simple identifier) keeps the qualified spelling;
+        // bare `requireNonNull` is dropped. The fully-qualified spelling
+        // (`java.util.Objects.requireNonNull`) has a field-access chain as
+        // receiver, which the PascalCase matcher does not see — a known
+        // gap, not this test's concern.
+        let source = "package com.example;\n\
+             import java.util.Objects;\n\
+             public class J {\n\
+             \tpublic void m(java.util.List<String> xs) {\n\
+             \t\tObjects.requireNonNull(xs);\n\
+             \t}\n\
+             }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new("J.java"), "hash", None)
+            .unwrap();
+        let m = analysis.functions.iter().find(|f| f.name == "m").unwrap();
+        let calls = m.calls.clone().unwrap_or_default();
+        let debug = format!("{calls:?}");
+        assert!(
+            debug.contains("Objects.requireNonNull"),
+            "qualified Java static edge: {debug}"
+        );
+        assert!(
+            !debug.split('"').any(|s| s == "requireNonNull"),
+            "bare `requireNonNull` absent (replaced by qualified): {debug}"
+        );
+    }
 }

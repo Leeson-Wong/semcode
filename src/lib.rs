@@ -136,3 +136,30 @@ pub mod logging {
             .init();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One serial test, not three parallel ones: they all mutate the same
+    // environment variable, and cargo runs tests on separate threads.
+    #[test]
+    fn worker_limit_reads_env_serially() {
+        // Unset: every core — CLI users want speed, and the plugin (which
+        // wants modesty) always sets the variable.
+        std::env::remove_var("SEMCODE_WORKERS");
+        assert_eq!(worker_limit(), num_cpus::get());
+
+        // A valid value caps the count.
+        std::env::set_var("SEMCODE_WORKERS", "4");
+        assert_eq!(worker_limit(), 4);
+
+        // Zero and garbage mean unset, not 1.
+        std::env::set_var("SEMCODE_WORKERS", "0");
+        assert_eq!(worker_limit(), num_cpus::get(), "0 means unset, not 1");
+        std::env::set_var("SEMCODE_WORKERS", "not_a_number");
+        assert_eq!(worker_limit(), num_cpus::get());
+
+        std::env::remove_var("SEMCODE_WORKERS");
+    }
+}

@@ -9020,7 +9020,7 @@ mod tests {
         // looked rebuilt while serving stale-space vectors. The drop-based
         // clear must leave empty, existing tables behind.
         let temp_dir = tempfile::tempdir().unwrap();
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             temp_dir.path().to_str().unwrap(),
             temp_dir.path().to_string_lossy().into_owned(),
         )
@@ -9082,7 +9082,7 @@ mod tests {
     #[tokio::test]
     async fn new_tables_use_lance_format_2_2() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             temp_dir.path().to_str().unwrap(),
             temp_dir.path().to_string_lossy().into_owned(),
         )
@@ -9171,7 +9171,7 @@ mod tests {
             .unwrap();
 
         let db_path = repo_path.join(".semcode.db");
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             db_path.to_str().unwrap(),
             repo_path.to_string_lossy().into_owned(),
         )
@@ -9233,7 +9233,7 @@ mod tests {
         let file_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "arms.c")
             .unwrap()
             .unwrap();
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             repo_path.join(".semcode.db").to_str().unwrap(),
             repo_path.to_string_lossy().into_owned(),
         )
@@ -9295,7 +9295,7 @@ mod tests {
             .unwrap();
 
         let db_path = repo_path.join(".semcode.db");
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             db_path.to_str().unwrap(),
             repo_path.to_string_lossy().into_owned(),
         )
@@ -9363,7 +9363,7 @@ mod tests {
         use crate::types::{Registration, RegistrationKind};
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             temp_dir.path().to_str().unwrap(),
             temp_dir.path().to_string_lossy().into_owned(),
         )
@@ -9421,7 +9421,7 @@ mod tests {
         use crate::types::{DispatchKind, DispatchSite};
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             temp_dir.path().to_str().unwrap(),
             temp_dir.path().to_string_lossy().into_owned(),
         )
@@ -9458,7 +9458,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_lookup_returns_every_definition_of_a_name() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             temp_dir.path().to_str().unwrap(),
             temp_dir.path().to_string_lossy().into_owned(),
         )
@@ -9507,7 +9507,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let db_path = repo_path.join(".semcode.db");
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             db_path.to_str().unwrap(),
             repo_path.to_string_lossy().into_owned(),
         )
@@ -9636,7 +9636,7 @@ mod tests {
         let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
 
         let db_path = repo_path.join(".semcode.db");
-        let db = DatabaseManager::new(
+        let db = super::DatabaseManager::new(
             db_path.to_str().unwrap(),
             repo_path.to_string_lossy().into_owned(),
         )
@@ -9830,5 +9830,89 @@ mod local_uri_tests {
         ] {
             assert_eq!(local_uri(path), path, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn slot_resolution_maps_at_n_to_field_name_and_drops_non_fnptr() {
+        // The extractor records {..., client_attach, ...} as @1; the
+        // resolver names it from the struct's field order. A string slot
+        // fed by an identifier (slot 0: a name, not a function) drops.
+        // Verified end-to-end on a minimal INDIGO-shaped fixture.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = super::DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        // Struct with mixed field kinds.
+        let t = crate::types::TypeInfo {
+            name: "struct indigo_test".to_string(),
+            file_path: "indigo.h".to_string(),
+            git_file_hash: "hash".to_string(),
+            line_start: 1,
+            kind: "struct".to_string(),
+            size: None,
+            members: vec![
+                crate::types::FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "const char *".to_string(),
+                    offset: None,
+                },
+                crate::types::FieldInfo {
+                    name: "attach".to_string(),
+                    type_name: "int (*)(void *)".to_string(),
+                    offset: None,
+                },
+            ],
+            definition: String::new(),
+            types: None,
+            qualifier: None,
+        };
+        db.insert_types(vec![t]).await.unwrap();
+
+        // Positional registrations: @0 (string slot, identifier macro) and
+        // @1 (function pointer slot).
+        let regs = vec![
+            crate::types::Registration {
+                container_type: "indigo_test".to_string(),
+                container_base_type: None,
+                container_field: None,
+                member: "@0".to_string(),
+                target: "SOME_STRING_MACRO".to_string(),
+                file_path: "driver.c".to_string(),
+                git_file_hash: "hash".to_string(),
+                byte_start: 100,
+                line: 5,
+                enclosing_function: String::new(),
+                kind: crate::types::RegistrationKind::PositionalInit,
+            },
+            crate::types::Registration {
+                container_type: "indigo_test".to_string(),
+                container_base_type: None,
+                container_field: None,
+                member: "@1".to_string(),
+                target: "client_attach".to_string(),
+                file_path: "driver.c".to_string(),
+                git_file_hash: "hash".to_string(),
+                byte_start: 200,
+                line: 6,
+                enclosing_function: String::new(),
+                kind: crate::types::RegistrationKind::PositionalInit,
+            },
+        ];
+        db.insert_registrations(regs).await.unwrap();
+
+        let (resolved, dropped) = db.resolve_slot_registrations().await.unwrap();
+        assert_eq!(resolved, 1, "only the function-pointer slot resolves");
+        assert_eq!(dropped, 1, "the string slot drops");
+
+        // The surviving row has the field name, not @1.
+        let by_target = db.find_registrations_of("client_attach").await.unwrap();
+        assert_eq!(by_target.len(), 1);
+        assert_eq!(by_target[0].member, "attach");
+        assert_eq!(by_target[0].container_type, "indigo_test");
     }
 }
